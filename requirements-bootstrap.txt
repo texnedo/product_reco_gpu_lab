@@ -1,0 +1,4 @@
+azure-ai-ml>=1.30,<2
+azure-identity>=1.24,<2
+pyarrow>=14,<24
+PyYAML>=6,<7

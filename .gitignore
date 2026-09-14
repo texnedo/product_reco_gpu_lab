@@ -1,0 +1,15 @@
+# Local Azure configuration (copy from .aml.env.example).
+*.aml.env
+
+# Generated data and temporary upload staging.
+artifacts/
+.aml-staging/
+
+# Python/editor state.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.vscode/
+.idea/
+

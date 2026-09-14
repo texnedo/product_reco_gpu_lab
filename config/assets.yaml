@@ -1,0 +1,34 @@
+# Paths are resolved from the project root, not from this file's directory.
+# The defaults match a checkout where product_reco_gpu_lab and ext_repos are
+# siblings. Environment variables can override both source paths.
+
+data:
+  esci:
+    name: esci-ranking
+    version: "1"
+    description: Amazon ESCI shopping-query dataset filtered to US English.
+    source_path: ../ext_repos/esci-data/shopping_queries_dataset
+    source_path_env: ESCI_DATA_PATH
+    source_revision: 7916cdf6ab75a462e77f20ab40428a10923998d5
+    prepared_path: artifacts/esci/v1
+    locale: us
+    files:
+      examples: shopping_queries_dataset_examples.parquet
+      products: shopping_queries_dataset_products.parquet
+
+models:
+  qwen:
+    name: qwen3-reranker-0-6b
+    version: "1"
+    description: Qwen3 Reranker 0.6B checkpoint for ESCI relevance fine-tuning.
+    source_path: ../ext_repos/Qwen3-Reranker-0.6B
+    source_path_env: QWEN_MODEL_PATH
+    hf_repo: Qwen/Qwen3-Reranker-0.6B
+    hf_revision: e61197ed45024b0ed8a2d74b80b4d909f1255473
+    exclude:
+      - .git
+    required_files:
+      - config.json
+      - model.safetensors
+      - tokenizer.json
+      - tokenizer_config.json
