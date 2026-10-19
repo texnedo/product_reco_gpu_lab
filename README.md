@@ -57,3 +57,54 @@ ignored by Git.
 To create a new immutable dataset revision, change both `version` and
 `prepared_path` in `config/assets.yaml`; never reuse a registered version for
 different content.
+
+## Train the v1 ESCI reranker
+
+The versioned instruction is stored in `config/prompts/esci_v1.txt`. The job
+keeps Qwen3-Reranker's native `yes`/`no` output and defines the product ranking
+score as `yes_logit - no_logit`. It applies LoRA to the transformer and trains
+same-query product pairs with RankNet under the order `E > S > C > I`.
+Same-label pairs are not constrained because ESCI provides no ordering within
+a label.
+
+Submit the initial T4-sized experiment after both input assets are registered:
+
+```bash
+source local.aml.env
+python jobs/submit_train_esci.py
+```
+
+The default run selects complete candidate groups for 5,000 training queries
+and 1,000 test queries from ESCI's `small_version`. It samples up to 12
+different-label pairs per training query on each epoch. It uses one epoch,
+sequence length 512, pair batch size 4 (eight independently scored products),
+and eight-step gradient accumulation. Scale these limits only after the first
+run is healthy:
+
+```bash
+python jobs/submit_train_esci.py \
+    --train-queries 20000 \
+    --eval-queries 5000 \
+    --epochs 2
+```
+
+The submission script creates the immutable `qwen-esci-training:1` environment
+from `environments/train/` the first time it runs. The job consumes:
+
+```text
+azureml:esci-ranking:1
+azureml:qwen3-reranker-0-6b:1
+```
+
+It emits two AML outputs:
+
+- `trained_model`: the LoRA adapter and a merged, self-contained model;
+- `evaluation`: aggregate metrics, per-query metrics, and product scores.
+
+NDCG uses graded relevance `E=3, S=2, C=1, I=0`. Direct Precision@10 and
+Recall@10 treat `E` and `S` as relevant; broad Precision@10 and Recall@10 also
+count `C`. Metrics are first calculated per query and then averaged. Queries
+with no relevant candidates remain in precision, but are excluded from recall
+and NDCG averages where the denominator is zero. The prediction artifact logs
+both logits, the ranking score, and `sigmoid(score)` as an explicitly
+uncalibrated diagnostic.

@@ -1,0 +1,9 @@
+Rank the PRODUCT by how useful it is as a shopping result for the QUERY.
+
+Prefer relationships in this order:
+1. The product directly satisfies the query and all explicit constraints.
+2. The product can replace the requested item but is not an exact match.
+3. The product complements or is used together with the requested item.
+4. The product is neither a match, substitute, nor meaningful complement.
+
+A replacement is a substitute, while an accessory is a complement.

@@ -4,7 +4,7 @@
 
 Build an end-to-end lab for training, packaging, deploying, and optimizing a small Qwen-based product reranker on Azure ML.
 
-Use the Amazon ESCI dataset, filtered to English. ESCI provides a query, a set of candidate products, and graded relevance labels (`E > C > S > I`). Retrieval is out of scope initially: treat the candidate set supplied by ESCI as the output of an upstream retrieval stage.
+Use the Amazon ESCI dataset, filtered to English. ESCI provides a query, a set of candidate products, and graded relevance labels (`E > S > C > I`). Retrieval is out of scope initially: treat the candidate set supplied by ESCI as the output of an upstream retrieval stage.
 
 The initial model should score each `(query, product)` pair independently. Scores are then used to rank all candidates for a query and evaluate ranking quality, primarily with NDCG.
 
@@ -18,8 +18,16 @@ The initial model should score each `(query, product)` pair independently. Score
    * ~~Use a pinned local Qwen3-Reranker-0.6B checkpoint.~~
    * ~~Create an idempotent uploader for versioned AML data/model assets.~~
    * Run the bootstrap and verify the registered assets in the workspace.
-4. Fine-tune Qwen for product relevance scoring.
-5. Evaluate model quality on held-out ESCI queries using ranking metrics such as NDCG.
+4. Fine-tune Qwen for product relevance scoring:
+
+   * ~~Version the v1 ESCI ranking instruction.~~
+   * ~~Create a single-T4 LoRA + RankNet training job using query-grouped pairs and the registered inputs.~~
+   * Run the initial AML training experiment and inspect its outputs.
+5. Evaluate model quality on held-out ESCI queries:
+
+   * ~~Calculate direct (`E/S`) and broad (`E/S/C`) query-grouped Precision@K and Recall@K.~~
+   * ~~Calculate graded NDCG@K with `E=3, S=2, C=1, I=0` and retain per-query results.~~
+   * Compare the trained model with the unchanged binary-reranker baseline.
 6. Package and deploy the trained model using a modern GPU inference runtime.
 7. Build a C++ traffic generator that simulates production search traffic.
 8. Benchmark and optimize inference, including:
