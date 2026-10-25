@@ -2,13 +2,63 @@ from __future__ import annotations
 
 import sys
 import unittest
+from collections import Counter
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from esci_core import GRADE, ranking_metrics, sample_training_pairs  # noqa: E402
+from esci_core import (  # noqa: E402
+    GRADE,
+    clean_product_text,
+    product_document,
+    ranking_metrics,
+    sample_training_pairs,
+)
+
+
+class ProductTextCleaningTests(unittest.TestCase):
+    def test_basic_v1_removes_html_entities_scripts_and_normalizes_space(self) -> None:
+        raw = (
+            "<p>Strong&nbsp;steel   &amp; aluminum.</p>"
+            "<script>ignore()</script><br>Fits model X."
+        )
+
+        self.assertEqual(
+            clean_product_text(raw, "basic_v1"),
+            "Strong steel & aluminum. Fits model X.",
+        )
+
+    def test_basic_v1_retains_repeated_values_inside_a_distinct_segment(self) -> None:
+        raw = "Includes 2 x 2-inch filters, size < 5 > 3, and fits A, A1, and A2."
+
+        self.assertEqual(clean_product_text(raw, "basic_v1"), raw)
+        self.assertEqual(clean_product_text(None, "basic_v1"), "[MISSING]")
+
+    def test_basic_v1_does_not_remove_repeated_sentences(self) -> None:
+        raw = "<p>Fast.</p><p>Fast.</p>"
+
+        self.assertEqual(clean_product_text(raw, "basic_v1"), "Fast. Fast.")
+
+    def test_product_document_preserves_legacy_mode_and_cleans_when_enabled(self) -> None:
+        row = {
+            "product_title": "<b>Widget</b>",
+            "product_brand": "Acme",
+            "product_color": None,
+            "product_bullet_point": "<p>Fast.</p><p>Fast.</p>",
+            "product_description": "Useful &amp; sturdy.",
+        }
+
+        self.assertIn("<b>Widget</b>", product_document(row, "none"))
+        cleaned = product_document(row, "basic_v1")
+        self.assertIn("Title: Widget", cleaned)
+        self.assertIn("Bullet points: Fast. Fast.", cleaned)
+        self.assertIn("Description: Useful & sturdy.", cleaned)
+
+    def test_unknown_cleaning_mode_fails_loudly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown text cleaning mode"):
+            clean_product_text("text", "future_mode")
 
 
 class PairSamplingTests(unittest.TestCase):
@@ -39,6 +89,55 @@ class PairSamplingTests(unittest.TestCase):
     def test_query_with_one_label_produces_no_pairs(self) -> None:
         pairs = sample_training_pairs([1, 1, 2, 2], ["E", "E", "I", "I"], 4, 1)
         self.assertEqual(pairs, [])
+
+    def test_mixed_sampler_preserves_budget_and_reduces_global_imbalance(self) -> None:
+        query_ids: list[int] = []
+        labels: list[str] = []
+        # Most queries only support E>S, reproducing the structural imbalance
+        # in ESCI. A smaller group supports all six pair types.
+        for query_id in range(10):
+            query_ids.extend([query_id] * 4)
+            labels.extend(["E", "E", "S", "S"])
+        for query_id in range(10, 14):
+            query_ids.extend([query_id] * 8)
+            labels.extend(["E", "E", "S", "S", "C", "C", "I", "I"])
+
+        natural = sample_training_pairs(query_ids, labels, 6, seed=42)
+        mixed = sample_training_pairs(
+            query_ids,
+            labels,
+            6,
+            seed=42,
+            sampling_strategy="mixed_type_balanced",
+            balance_fraction=0.5,
+            balanced_pairs_per_type_per_query=4,
+        )
+        repeated = sample_training_pairs(
+            query_ids,
+            labels,
+            6,
+            seed=42,
+            sampling_strategy="mixed_type_balanced",
+            balance_fraction=0.5,
+            balanced_pairs_per_type_per_query=4,
+        )
+
+        self.assertEqual(mixed, repeated)
+        self.assertEqual(len(mixed), len(natural))
+        self.assertEqual(
+            len({(pair.higher_index, pair.lower_index) for pair in mixed}),
+            len(mixed),
+        )
+        for pair in mixed:
+            self.assertEqual(
+                query_ids[pair.higher_index], query_ids[pair.lower_index]
+            )
+
+        natural_counts = Counter(pair.pair_type for pair in natural)
+        mixed_counts = Counter(pair.pair_type for pair in mixed)
+        natural_spread = max(natural_counts.values()) - min(natural_counts.values())
+        mixed_spread = max(mixed_counts.values()) - min(mixed_counts.values())
+        self.assertLess(mixed_spread, natural_spread)
 
 
 class RankingMetricsTests(unittest.TestCase):

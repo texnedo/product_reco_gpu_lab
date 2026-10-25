@@ -42,10 +42,10 @@ import os
 import random
 import shutil
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 import duckdb
 import pandas as pd
@@ -60,17 +60,31 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
+from checkpoint_core import (
+    CheckpointProgress,
+    checkpoint_signature,
+    remaining_epoch_items,
+    shuffled_epoch_items,
+)
 from esci_core import (
     BROAD_RELEVANT,
     DIRECT_RELEVANT,
     GRADE,
     LABEL_ORDER,
+    TEXT_CLEANING_MODES,
     TrainingPair,
     flatten_metrics,
     product_document,
     ranking_metrics,
     safe_text,
     sample_training_pairs,
+)
+from training_checkpoint import (
+    best_checkpoint_metadata,
+    load_best_model_checkpoint,
+    load_training_checkpoint,
+    save_best_training_checkpoint,
+    save_training_checkpoint,
 )
 
 try:
@@ -84,6 +98,11 @@ except ImportError:
 EXAMPLES_FILE = "shopping_queries_dataset_examples.parquet"
 PRODUCTS_FILE = "shopping_queries_dataset_products.parquet"
 
+
+def selection_history_sort_key(row: dict[str, Any]) -> int:
+    return int(row["optimizer_step"])
+
+
 # Native Qwen3-Reranker prompt contract. The contents of esci_v1.txt become
 # <Instruct>; they explain what "meets the requirements" means for products.
 RERANKER_PREFIX = (
@@ -95,6 +114,96 @@ RERANKER_PREFIX = (
 RERANKER_SUFFIX = (
     "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 )
+
+
+def training_run_configuration(
+    args: argparse.Namespace,
+    instruction: str,
+    train_frame: Any,
+    initial_pair_count: int,
+    development_frame: Any = None,
+) -> dict[str, Any]:
+    """Describe every setting that must match when state is restored."""
+    training_rows = hashlib.sha256()
+    for query_id, product_id, label in train_frame[
+        ["query_id", "product_id", "esci_label"]
+    ].itertuples(index=False, name=None):
+        training_rows.update(
+            f"{query_id!r}\0{product_id!r}\0{label}\n".encode("utf-8")
+        )
+    model_config = args.model_dir / "config.json"
+    model_config_hash = (
+        hashlib.sha256(model_config.read_bytes()).hexdigest()
+        if model_config.is_file()
+        else None
+    )
+    development_rows_hash = None
+    if development_frame is not None:
+        development_rows = hashlib.sha256()
+        for query_id, product_id, label in development_frame[
+            ["query_id", "product_id", "esci_label"]
+        ].itertuples(index=False, name=None):
+            development_rows.update(
+                f"{query_id!r}\0{product_id!r}\0{label}\n".encode("utf-8")
+            )
+        development_rows_hash = development_rows.hexdigest()
+    return {
+        "prompt_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+        "model_config_sha256": model_config_hash,
+        "training_rows_sha256": training_rows.hexdigest(),
+        "initial_pair_count": initial_pair_count,
+        "development_rows_sha256": development_rows_hash,
+        "epochs": args.epochs,
+        "max_length": args.max_length,
+        "text_cleaning": args.text_cleaning,
+        "train_batch_size": args.train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "warmup_ratio": args.warmup_ratio,
+        "weight_decay": args.weight_decay,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "pairs_per_query": args.pairs_per_query,
+        "pair_weighting": args.pair_weighting,
+        "sampling_strategy": args.sampling_strategy,
+        "balance_fraction": args.balance_fraction,
+        "balanced_pairs_per_type_per_query": (
+            args.balanced_pairs_per_type_per_query
+        ),
+        "selection_queries": args.selection_queries,
+        "selection_every_steps": args.selection_every_steps,
+        "selection_min_delta": args.selection_min_delta,
+        "eval_queries": args.eval_queries,
+        "ndcg_k": args.ndcg_k,
+        "seed": args.seed,
+    }
+
+
+def experiment_config_sha256(args: argparse.Namespace) -> Optional[str]:
+    if args.experiment_config_file is None:
+        return None
+    return hashlib.sha256(args.experiment_config_file.read_bytes()).hexdigest()
+
+
+def sample_pairs(
+    args: argparse.Namespace,
+    query_ids: Sequence[Any],
+    labels: Sequence[str],
+    seed: int,
+) -> list[TrainingPair]:
+    """Apply the configured sampler consistently to setup and every epoch."""
+    return sample_training_pairs(
+        query_ids,
+        labels,
+        args.pairs_per_query,
+        seed,
+        sampling_strategy=args.sampling_strategy,
+        balance_fraction=args.balance_fraction,
+        balanced_pairs_per_type_per_query=(
+            args.balanced_pairs_per_type_per_query
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -156,10 +265,12 @@ class ProductDataset(Dataset):
         frame: Any,
         tokenizer: Any,
         prompt_encoding: PromptEncoding,
+        text_cleaning: str,
     ) -> None:
         self.columns = {name: frame[name].tolist() for name in frame.columns}
         self.tokenizer = tokenizer
         self.prompt_encoding = prompt_encoding
+        self.text_cleaning = text_cleaning
 
     def __len__(self) -> int:
         return len(self.columns["esci_label"])
@@ -169,7 +280,7 @@ class ProductDataset(Dataset):
         variable_text = (
             f"{safe_text(row['query'])}"
             f"{self.prompt_encoding.document_separator}"
-            f"{product_document(row)}"
+            f"{product_document(row, self.text_cleaning)}"
         )
         variable_ids = self.tokenizer.encode(
             variable_text,
@@ -321,7 +432,12 @@ def forward_yes_no(
     adapted transformer layers. It only bypasses the unnecessary parts of the
     existing vocabulary projection.
     """
-    causal_model = model.get_base_model()
+    # PEFT exposes get_base_model(); an unwrapped Hugging Face model does not.
+    # Supporting both is what lets --eval-only score the untouched base model
+    # through exactly the same math used after LoRA training.
+    causal_model = (
+        model.get_base_model() if hasattr(model, "get_base_model") else model
+    )
     # hidden_states: [B, T, D]. LoRA participates in this decoder computation.
     hidden_states = causal_model.model(
         input_ids=input_ids,
@@ -428,13 +544,338 @@ def load_split(
     return frame
 
 
+def select_development_frame(
+    eval_frame: Any, query_count: int, seed: int
+) -> Any:
+    """Choose a stable complete-query subset from the larger evaluation frame."""
+    query_ids = list(eval_frame["query_id"].unique())
+    hashed_query_ids = sorted(
+        (
+            hashlib.sha256(
+                f"{seed}:development:{query_id}".encode("utf-8")
+            ).digest(),
+            query_id,
+        )
+        for query_id in query_ids
+    )
+    ordered = [query_id for _, query_id in hashed_query_ids]
+    selected = set(ordered[:query_count])
+    frame = eval_frame[eval_frame["query_id"].isin(selected)].copy()
+    print(
+        f"Selected development subset: {frame['query_id'].nunique():,} queries, "
+        f"{len(frame):,} products",
+        flush=True,
+    )
+    return frame
+
+
+def score_product_loader(
+    model: Any,
+    loader: Any,
+    device: Any,
+    yes_no_token_tensor: Any,
+    description: str,
+) -> dict[str, list[Any]]:
+    """Score a pointwise loader and restore the caller's train/eval mode."""
+    was_training = model.training
+    python_rng_state = random.getstate()
+    torch_rng_state = torch.get_rng_state()
+    cuda_rng_state_all = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    )
+    model.eval()
+    output: dict[str, list[Any]] = {
+        "gold_labels": [],
+        "query_ids": [],
+        "product_ids": [],
+        "yes_logits": [],
+        "no_logits": [],
+        "ranking_scores": [],
+    }
+    try:
+        with torch.inference_mode():
+            for batch in tqdm(loader, desc=description, leave=False):
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(
+                    device, non_blocking=True
+                )
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    logits, scores = forward_yes_no(
+                        model,
+                        input_ids,
+                        attention_mask,
+                        yes_no_token_tensor,
+                    )
+                cpu_logits = logits.float().cpu()
+                output["yes_logits"].extend(cpu_logits[:, 0].tolist())
+                output["no_logits"].extend(cpu_logits[:, 1].tolist())
+                output["ranking_scores"].extend(scores.float().cpu().tolist())
+                output["gold_labels"].extend(batch["gold_labels"])
+                output["query_ids"].extend(batch["query_ids"])
+                output["product_ids"].extend(batch["product_ids"])
+    finally:
+        # Creating worker iterators and some CUDA kernels can advance RNG state.
+        # Evaluation must observe training without altering its subsequent
+        # dropout masks or retry determinism.
+        random.setstate(python_rng_state)
+        torch.set_rng_state(torch_rng_state)
+        if torch.cuda.is_available() and cuda_rng_state_all:
+            torch.cuda.set_rng_state_all(cuda_rng_state_all)
+        if was_training:
+            model.train()
+    return output
+
+
+def evaluate_development(
+    args: argparse.Namespace,
+    model: Any,
+    development_loader: Any,
+    device: Any,
+    yes_no_token_tensor: Any,
+    global_step: int,
+) -> dict[str, Any]:
+    """Evaluate the fixed selection subset without writing prediction files."""
+    scored = score_product_loader(
+        model,
+        development_loader,
+        device,
+        yes_no_token_tensor,
+        description=f"development step {global_step}",
+    )
+    ranking, _ = ranking_metrics(
+        scored["query_ids"],
+        scored["gold_labels"],
+        scored["ranking_scores"],
+        args.ndcg_k,
+    )
+    print(
+        f"Development metrics at optimizer step {global_step}: "
+        + json.dumps(ranking, sort_keys=True),
+        flush=True,
+    )
+    if mlflow is not None:
+        try:
+            mlflow.log_metrics(
+                flatten_metrics({"development": ranking}), step=global_step
+            )
+        except Exception as exc:
+            print(f"warning: MLflow development logging was unavailable: {exc}")
+    return ranking
+
+
+def evaluate_and_write_outputs(
+    args: argparse.Namespace,
+    model: Any,
+    eval_loader: Any,
+    device: Any,
+    yes_no_token_tensor: Any,
+    eval_frame: Any,
+    instruction: str,
+    training_history: list[dict[str, Any]],
+    train_frame: Any = None,
+    selection_history: Optional[list[dict[str, Any]]] = None,
+    selected_checkpoint: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Run the serving-time scorer and persist one comparable evaluation."""
+    scored = score_product_loader(
+        model,
+        eval_loader,
+        device,
+        yes_no_token_tensor,
+        description="final evaluation",
+    )
+    gold_labels = scored["gold_labels"]
+    query_ids = scored["query_ids"]
+    product_ids = scored["product_ids"]
+    yes_logits = scored["yes_logits"]
+    no_logits = scored["no_logits"]
+    ranking_scores = scored["ranking_scores"]
+
+    ranking, per_query = ranking_metrics(
+        query_ids, gold_labels, ranking_scores, args.ndcg_k
+    )
+    configuration = {
+        "run_mode": "base_model_evaluation" if args.eval_only else "lora_training",
+        "model_variant": (
+            "unmodified_base_model" if args.eval_only else "lora_fine_tuned"
+        ),
+        "objective": "none" if args.eval_only else "ranknet_pairwise",
+        "score": "yes_logit - no_logit",
+        "prompt_version": "esci_v1",
+        "prompt_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+        "label_order": list(LABEL_ORDER),
+        "graded_relevance": GRADE,
+        "direct_relevant_labels": sorted(DIRECT_RELEVANT),
+        "broad_relevant_labels": sorted(BROAD_RELEVANT),
+        "train_products": 0 if train_frame is None else len(train_frame),
+        "train_queries": (
+            0 if train_frame is None else int(train_frame["query_id"].nunique())
+        ),
+        "eval_products": len(eval_frame),
+        "eval_queries": int(eval_frame["query_id"].nunique()),
+        "max_length": args.max_length,
+        "text_cleaning": args.text_cleaning,
+        "small_version": args.small_version,
+        "epochs": 0 if args.eval_only else args.epochs,
+        "eval_batch_size": args.eval_batch_size,
+        "num_workers": args.num_workers,
+        "seed": args.seed,
+        "experiment_config": (
+            args.experiment_config_file.name
+            if args.experiment_config_file is not None
+            else None
+        ),
+        "experiment_config_sha256": experiment_config_sha256(args),
+        "run_display_name": args.run_display_name,
+    }
+    if not args.eval_only:
+        configuration.update(
+            {
+                "pairs_per_query": args.pairs_per_query,
+                "pair_weighting": args.pair_weighting,
+                "sampling_strategy": args.sampling_strategy,
+                "balance_fraction": args.balance_fraction,
+                "balanced_pairs_per_type_per_query": (
+                    args.balanced_pairs_per_type_per_query
+                ),
+                "learning_rate": args.learning_rate,
+                "warmup_ratio": args.warmup_ratio,
+                "weight_decay": args.weight_decay,
+                "train_batch_size": args.train_batch_size,
+                "gradient_accumulation_steps": (
+                    args.gradient_accumulation_steps
+                ),
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
+                "lora_dropout": args.lora_dropout,
+                "selection_queries": args.selection_queries,
+                "selection_every_steps": args.selection_every_steps,
+                "selection_min_delta": args.selection_min_delta,
+            }
+        )
+    metrics = {
+        "training": {"epochs": training_history},
+        "ranking": ranking,
+        "configuration": configuration,
+    }
+    if not args.eval_only:
+        metrics["model_selection"] = {
+            "metric": f"ndcg@{args.ndcg_k}",
+            "history": selection_history or [],
+            "selected_checkpoint": selected_checkpoint,
+        }
+    print(json.dumps(metrics, indent=2))
+
+    args.metrics_output.mkdir(parents=True, exist_ok=True)
+    (args.metrics_output / "metrics.json").write_text(
+        json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    with (args.metrics_output / "per_query_metrics.jsonl").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        for row in per_query:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+    # sigmoid(score) is a useful diagnostic, but neither the base reranker nor
+    # RankNet guarantees that it is calibrated as an ESCI relevance probability.
+    yes_probability = [
+        1.0 / (1.0 + math.exp(-max(min(score, 60.0), -60.0)))
+        for score in ranking_scores
+    ]
+    prediction_frame = pd.DataFrame(
+        {
+            "query_id": query_ids,
+            "product_id": product_ids,
+            "gold_label": gold_labels,
+            "yes_logit": yes_logits,
+            "no_logit": no_logits,
+            "ranking_score": ranking_scores,
+            "yes_probability_uncalibrated": yes_probability,
+        }
+    )
+    prediction_frame["predicted_rank"] = (
+        prediction_frame.groupby("query_id")["ranking_score"]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+    prediction_frame.to_parquet(
+        args.metrics_output / "predictions.parquet", index=False
+    )
+
+    mlflow_metrics: dict[str, Any] = {"ranking": ranking}
+    if training_history:
+        mlflow_metrics["final_training"] = {
+            "mean_ranknet_loss": training_history[-1]["mean_ranknet_loss"],
+            "pair_accuracy": training_history[-1]["pair_accuracy"],
+        }
+    if selected_checkpoint is not None:
+        mlflow_metrics["model_selection"] = {
+            "selected_step": int(selected_checkpoint["global_step"]),
+            "selected_development_metric": float(
+                selected_checkpoint["selection_metric_value"]
+            ),
+        }
+    if mlflow is None:
+        print("warning: MLflow is not installed; metrics remain in the AML output")
+    else:
+        try:
+            mlflow.log_metrics(flatten_metrics(mlflow_metrics))
+            mlflow.log_artifacts(
+                str(args.metrics_output), artifact_path="evaluation"
+            )
+        except Exception as exc:
+            print(f"warning: MLflow logging was unavailable: {exc}")
+    return metrics
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--model-output", type=Path, required=True)
+    parser.add_argument(
+        "--experiment-config-file",
+        type=Path,
+        help="Source YAML used by the submitter; hashed into run metadata.",
+    )
+    parser.add_argument(
+        "--run-display-name",
+        help="Self-describing AML display name recorded with evaluation metadata.",
+    )
+    parser.add_argument(
+        "--model-output",
+        type=Path,
+        help="Required for training; omitted for a base-model evaluation.",
+    )
     parser.add_argument("--metrics-output", type=Path, required=True)
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Evaluate the unmodified base model without LoRA or optimization.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        help="Durable directory for periodic state; use an AML rw_mount output.",
+    )
+    parser.add_argument(
+        "--checkpoint-every-steps",
+        type=int,
+        default=25,
+        help="Save after this many optimizer updates, plus every epoch boundary.",
+    )
+    parser.add_argument(
+        "--checkpoints-to-keep",
+        type=int,
+        default=3,
+        help="Retain this many newest complete checkpoints.",
+    )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resume the latest complete checkpoint when checkpoint-dir is set.",
+    )
     parser.add_argument("--train-queries", type=int, default=5_000)
     parser.add_argument("--eval-queries", type=int, default=1_000)
     parser.add_argument(
@@ -442,6 +883,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument(
+        "--text-cleaning",
+        choices=sorted(TEXT_CLEANING_MODES),
+        default="none",
+        help="Versioned product-field cleanup applied before token truncation.",
+    )
     # This batch size counts pairs, so four means eight model inputs.
     parser.add_argument("--train-batch-size", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=8)
@@ -454,12 +901,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--pairs-per-query", type=int, default=12)
     parser.add_argument(
+        "--sampling-strategy",
+        choices=("query_round_robin", "mixed_type_balanced"),
+        default="query_round_robin",
+    )
+    parser.add_argument("--balance-fraction", type=float, default=0.0)
+    parser.add_argument(
+        "--balanced-pairs-per-type-per-query",
+        type=int,
+        default=12,
+        help="Global balanced-pool cap for one pair type from one query.",
+    )
+    parser.add_argument(
         "--pair-weighting",
         choices=("none", "grade_gap"),
         default="none",
         help="Optionally weight E>I more than adjacent-label comparisons.",
     )
     parser.add_argument("--ndcg-k", type=int, default=10)
+    parser.add_argument(
+        "--selection-queries",
+        type=int,
+        default=0,
+        help="Fixed evaluation-query subset used for in-training model selection.",
+    )
+    parser.add_argument(
+        "--selection-every-steps",
+        type=int,
+        default=0,
+        help="Evaluate development NDCG after this many optimizer updates.",
+    )
+    parser.add_argument(
+        "--selection-min-delta",
+        type=float,
+        default=0.0,
+        help="Required strict NDCG improvement before replacing the best model.",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -469,33 +946,83 @@ def main() -> int:
     args = parse_args()
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     positive_values = {
-        "epochs": args.epochs,
         "max_length": args.max_length,
-        "train_batch_size": args.train_batch_size,
         "eval_batch_size": args.eval_batch_size,
-        "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "lora_rank": args.lora_rank,
-        "lora_alpha": args.lora_alpha,
-        "pairs_per_query": args.pairs_per_query,
         "ndcg_k": args.ndcg_k,
     }
+    if not args.eval_only:
+        positive_values.update(
+            {
+                "epochs": args.epochs,
+                "train_batch_size": args.train_batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
+                "pairs_per_query": args.pairs_per_query,
+                "balanced_pairs_per_type_per_query": (
+                    args.balanced_pairs_per_type_per_query
+                ),
+                "checkpoint_every_steps": args.checkpoint_every_steps,
+                "checkpoints_to_keep": args.checkpoints_to_keep,
+            }
+        )
     invalid = {name: value for name, value in positive_values.items() if value <= 0}
     if invalid:
         raise ValueError(f"These arguments must be positive: {invalid}")
+    if not args.eval_only and args.model_output is None:
+        raise ValueError("--model-output is required unless --eval-only is set")
+    selection_enabled = args.selection_queries > 0 or args.selection_every_steps > 0
+    if not args.eval_only and selection_enabled:
+        if args.selection_queries <= 0 or args.selection_every_steps <= 0:
+            raise ValueError(
+                "--selection-queries and --selection-every-steps must both be "
+                "positive when model selection is enabled"
+            )
+        if args.selection_queries > args.eval_queries:
+            raise ValueError("--selection-queries cannot exceed --eval-queries")
+        if args.checkpoint_dir is None:
+            raise ValueError(
+                "--checkpoint-dir is required for durable best-model selection"
+            )
+    if args.selection_min_delta < 0.0:
+        raise ValueError("--selection-min-delta cannot be negative")
+    if not selection_enabled and args.selection_min_delta != 0.0:
+        raise ValueError(
+            "--selection-min-delta requires development model selection"
+        )
+    if not 0.0 <= args.balance_fraction <= 1.0:
+        raise ValueError("--balance-fraction must be in [0, 1]")
+    if (
+        args.sampling_strategy == "query_round_robin"
+        and args.balance_fraction != 0.0
+    ):
+        raise ValueError("query_round_robin requires --balance-fraction 0")
+    if (
+        args.sampling_strategy == "mixed_type_balanced"
+        and args.balance_fraction <= 0.0
+    ):
+        raise ValueError("mixed_type_balanced requires --balance-fraction > 0")
+    if (
+        args.experiment_config_file is not None
+        and not args.experiment_config_file.is_file()
+    ):
+        raise FileNotFoundError(args.experiment_config_file)
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     if not torch.cuda.is_available():
-        raise RuntimeError("This training job requires a CUDA GPU")
+        raise RuntimeError("This Qwen scoring job requires a CUDA GPU")
 
     instruction = args.prompt_file.read_text(encoding="utf-8").strip()
     if not instruction:
         raise ValueError(f"Prompt file is empty: {args.prompt_file}")
-    train_frame = load_split(
-        args.data_dir, "train", args.train_queries, args.small_version, args.seed
-    )
+    train_frame = None
+    if not args.eval_only:
+        train_frame = load_split(
+            args.data_dir, "train", args.train_queries, args.small_version, args.seed
+        )
     eval_frame = load_split(
         args.data_dir, "test", args.eval_queries, args.small_version, args.seed
     )
@@ -511,12 +1038,10 @@ def main() -> int:
     print("Native answer token IDs:", answer_token_ids)
 
     prompt_encoding = PromptEncoding.build(tokenizer, instruction, args.max_length)
-    train_products = ProductDataset(
-        train_frame, tokenizer, prompt_encoding
+    eval_products = ProductDataset(
+        eval_frame, tokenizer, prompt_encoding, args.text_cleaning
     )
-    eval_products = ProductDataset(eval_frame, tokenizer, prompt_encoding)
     product_collator = ProductCollator(tokenizer.pad_token_id)
-    pair_collator = PairCollator(product_collator)
 
     eval_loader = DataLoader(
         eval_products,
@@ -526,12 +1051,58 @@ def main() -> int:
         num_workers=args.num_workers,
         pin_memory=True,
     )
+    development_frame = None
+    development_loader = None
+    if not args.eval_only and selection_enabled:
+        development_frame = select_development_frame(
+            eval_frame, args.selection_queries, args.seed
+        )
+        development_loader = DataLoader(
+            ProductDataset(
+                development_frame,
+                tokenizer,
+                prompt_encoding,
+                args.text_cleaning,
+            ),
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            collate_fn=product_collator,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
 
     device = torch.device("cuda")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir, local_files_only=True, dtype=torch.float16
     )
     model.config.use_cache = False
+
+    if args.eval_only:
+        model.to(device)
+        yes_no_token_tensor = torch.tensor(
+            [answer_token_ids["yes"], answer_token_ids["no"]],
+            dtype=torch.long,
+            device=device,
+        )
+        print("Evaluation-only mode: using the unmodified base Qwen model")
+        evaluate_and_write_outputs(
+            args,
+            model,
+            eval_loader,
+            device,
+            yes_no_token_tensor,
+            eval_frame,
+            instruction,
+            training_history=[],
+        )
+        return 0
+
+    # Everything below this branch is training-only. The baseline path never
+    # creates PEFT adapters, an optimizer, a scheduler, or checkpoints.
+    train_products = ProductDataset(
+        train_frame, tokenizer, prompt_encoding, args.text_cleaning
+    )
+    pair_collator = PairCollator(product_collator)
     model.gradient_checkpointing_enable()
     model = get_peft_model(
         model,
@@ -564,14 +1135,22 @@ def main() -> int:
 
     train_query_ids = train_frame["query_id"].tolist()
     train_labels = train_frame["esci_label"].tolist()
-    initial_pairs = sample_training_pairs(
-        train_query_ids, train_labels, args.pairs_per_query, args.seed
+    initial_pairs = sample_pairs(
+        args, train_query_ids, train_labels, args.seed
     )
     if not initial_pairs:
         raise RuntimeError("Training selection produced no cross-label query pairs")
     print(
         f"Sampled {len(initial_pairs):,} training pairs "
-        f"(up to {args.pairs_per_query} per query)"
+        f"with strategy={args.sampling_strategy!r} "
+        f"(reference budget {args.pairs_per_query} per query)"
+    )
+    initial_pair_type_counts = Counter(
+        pair.pair_type for pair in initial_pairs
+    )
+    print(
+        "Initial pair-type distribution:",
+        json.dumps(dict(sorted(initial_pair_type_counts.items()))),
     )
 
     optimizer = torch.optim.AdamW(
@@ -591,31 +1170,174 @@ def main() -> int:
     )
     scaler = torch.cuda.amp.GradScaler()
 
+    run_configuration = training_run_configuration(
+        args,
+        instruction,
+        train_frame,
+        len(initial_pairs),
+        development_frame,
+    )
+    run_signature = checkpoint_signature(run_configuration)
+    checkpoint_progress = None
+    if args.checkpoint_dir is not None and args.resume:
+        checkpoint_progress = load_training_checkpoint(
+            args.checkpoint_dir,
+            run_signature,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+        )
+    if checkpoint_progress is None:
+        checkpoint_progress = CheckpointProgress()
+    if checkpoint_progress.epoch_index > args.epochs:
+        raise RuntimeError(
+            "Checkpoint epoch is beyond configured training epochs: "
+            f"{checkpoint_progress.epoch_index} > {args.epochs}"
+        )
+
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    global_step = 0
-    training_history = []
-    for epoch in range(args.epochs):
-        epoch_pairs = sample_training_pairs(
-            train_query_ids,
-            train_labels,
-            args.pairs_per_query,
-            args.seed + epoch,
+    global_step = checkpoint_progress.global_step
+    training_history = list(checkpoint_progress.training_history)
+    selection_history = list(checkpoint_progress.selection_history)
+    selection_metric = f"ndcg@{args.ndcg_k}"
+    selected_checkpoint_metadata = None
+    best_selection_value = -math.inf
+    if development_loader is not None and args.resume:
+        resolved_best = best_checkpoint_metadata(
+            args.checkpoint_dir, run_signature
         )
+        if resolved_best is not None:
+            _, selected_checkpoint_metadata = resolved_best
+            best_selection_value = float(
+                selected_checkpoint_metadata["selection_metric_value"]
+            )
+            print(
+                "Recovered best model-selection state "
+                f"step={selected_checkpoint_metadata['global_step']} "
+                f"{selection_metric}={best_selection_value:.6f}",
+                flush=True,
+            )
+            selected_step = int(selected_checkpoint_metadata["global_step"])
+            if not any(
+                int(row["optimizer_step"]) == selected_step
+                for row in selection_history
+            ):
+                selection_history.append(
+                    {
+                        "optimizer_step": selected_step,
+                        "epoch_index": int(
+                            selected_checkpoint_metadata["epoch_index"]
+                        ),
+                        "next_batch_index": int(
+                            selected_checkpoint_metadata["next_batch_index"]
+                        ),
+                        "became_best": True,
+                        "ranking": selected_checkpoint_metadata[
+                            "development_metrics"
+                        ],
+                        "recovered_from_best_checkpoint": True,
+                    }
+                )
+                selection_history.sort(key=selection_history_sort_key)
+
+    # Step zero is useful evidence: training should have to beat the untouched
+    # reranker. On a retry with an existing best checkpoint, this work is not
+    # repeated.
+    if development_loader is not None and selected_checkpoint_metadata is None:
+        development_ranking = evaluate_development(
+            args,
+            model,
+            development_loader,
+            device,
+            yes_no_token_tensor,
+            global_step,
+        )
+        best_selection_value = float(development_ranking[selection_metric])
+        selection_history.append(
+            {
+                "optimizer_step": global_step,
+                "epoch_index": checkpoint_progress.epoch_index,
+                "next_batch_index": checkpoint_progress.next_batch_index,
+                "became_best": True,
+                "ranking": development_ranking,
+            }
+        )
+        save_best_training_checkpoint(
+            args.checkpoint_dir,
+            run_signature,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            CheckpointProgress(
+                epoch_index=checkpoint_progress.epoch_index,
+                next_batch_index=checkpoint_progress.next_batch_index,
+                global_step=global_step,
+                training_history=list(training_history),
+                accumulated_loss=checkpoint_progress.accumulated_loss,
+                correct_pairs=checkpoint_progress.correct_pairs,
+                observed_pairs=checkpoint_progress.observed_pairs,
+                pair_type_counts=dict(checkpoint_progress.pair_type_counts),
+                selection_history=list(selection_history),
+            ),
+            selection_metric,
+            best_selection_value,
+            development_ranking,
+        )
+        _, selected_checkpoint_metadata = best_checkpoint_metadata(
+            args.checkpoint_dir, run_signature
+        )
+
+    for epoch in range(checkpoint_progress.epoch_index, args.epochs):
+        epoch_pairs = shuffled_epoch_items(
+            sample_pairs(args, train_query_ids, train_labels, args.seed + epoch),
+            seed=args.seed + 1_000_003 + epoch,
+        )
+        total_epoch_batches = math.ceil(len(epoch_pairs) / args.train_batch_size)
+        if epoch == checkpoint_progress.epoch_index:
+            first_batch_index = checkpoint_progress.next_batch_index
+            accumulated_loss = checkpoint_progress.accumulated_loss
+            correct_pairs = checkpoint_progress.correct_pairs
+            observed_pairs = checkpoint_progress.observed_pairs
+            pair_type_counts: dict[str, int] = defaultdict(
+                int, checkpoint_progress.pair_type_counts
+            )
+        else:
+            first_batch_index = 0
+            accumulated_loss = 0.0
+            correct_pairs = 0
+            observed_pairs = 0
+            pair_type_counts = defaultdict(int)
+        if first_batch_index > total_epoch_batches:
+            raise RuntimeError(
+                f"Checkpoint batch {first_batch_index} exceeds epoch size "
+                f"{total_epoch_batches}"
+            )
+        remaining_pairs = remaining_epoch_items(
+            epoch_pairs, args.train_batch_size, first_batch_index
+        )
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(args.seed + 2_000_003 + epoch)
         train_loader = DataLoader(
-            PairDataset(train_products, epoch_pairs),
+            PairDataset(train_products, remaining_pairs),
             batch_size=args.train_batch_size,
-            shuffle=True,
+            shuffle=False,
             collate_fn=pair_collator,
             num_workers=args.num_workers,
             pin_memory=True,
+            generator=loader_generator,
         )
-        progress = tqdm(train_loader, desc=f"train epoch {epoch + 1}/{args.epochs}")
-        accumulated_loss = 0.0
-        correct_pairs = 0
-        observed_pairs = 0
-        pair_type_counts: dict[str, int] = defaultdict(int)
-        for batch_index, batch in enumerate(progress, start=1):
+        progress = tqdm(
+            train_loader,
+            desc=f"train epoch {epoch + 1}/{args.epochs}",
+            total=total_epoch_batches,
+            initial=first_batch_index,
+        )
+        for batch_index, batch in enumerate(
+            progress, start=first_batch_index + 1
+        ):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             grade_gaps = batch["grade_gaps"].to(device, non_blocking=True)
@@ -659,10 +1381,10 @@ def main() -> int:
                 # batches. The final group can be shorter; dividing it by the
                 # full size would silently shrink its gradient contribution.
                 final_group_size = (
-                    len(train_loader) % args.gradient_accumulation_steps
+                    total_epoch_batches % args.gradient_accumulation_steps
                     or args.gradient_accumulation_steps
                 )
-                final_group_start = len(train_loader) - final_group_size + 1
+                final_group_start = total_epoch_batches - final_group_size + 1
                 accumulation_divisor = (
                     final_group_size
                     if batch_index >= final_group_start
@@ -691,7 +1413,7 @@ def main() -> int:
 
             should_step = (
                 batch_index % args.gradient_accumulation_steps == 0
-                or batch_index == len(train_loader)
+                or batch_index == total_epoch_batches
             )
             if should_step:
                 scaler.unscale_(optimizer)
@@ -706,147 +1428,177 @@ def main() -> int:
                     pair_acc=f"{correct_pairs / observed_pairs:.3f}",
                     step=global_step,
                 )
+                final_training_step = (
+                    epoch == args.epochs - 1
+                    and batch_index == total_epoch_batches
+                )
+                should_evaluate_development = (
+                    development_loader is not None
+                    and (
+                        global_step % args.selection_every_steps == 0
+                        or final_training_step
+                    )
+                )
+                if should_evaluate_development:
+                    development_ranking = evaluate_development(
+                        args,
+                        model,
+                        development_loader,
+                        device,
+                        yes_no_token_tensor,
+                        global_step,
+                    )
+                    selection_value = float(
+                        development_ranking[selection_metric]
+                    )
+                    became_best = (
+                        selection_value
+                        > best_selection_value + args.selection_min_delta
+                    )
+                    selection_history.append(
+                        {
+                            "optimizer_step": global_step,
+                            "epoch_index": epoch,
+                            "next_batch_index": batch_index,
+                            "became_best": became_best,
+                            "ranking": development_ranking,
+                        }
+                    )
+                    if became_best:
+                        best_selection_value = selection_value
+                        save_best_training_checkpoint(
+                            args.checkpoint_dir,
+                            run_signature,
+                            model,
+                            optimizer,
+                            scheduler,
+                            scaler,
+                            CheckpointProgress(
+                                epoch_index=epoch,
+                                next_batch_index=batch_index,
+                                global_step=global_step,
+                                training_history=list(training_history),
+                                accumulated_loss=accumulated_loss,
+                                correct_pairs=correct_pairs,
+                                observed_pairs=observed_pairs,
+                                pair_type_counts=dict(pair_type_counts),
+                                selection_history=list(selection_history),
+                            ),
+                            selection_metric,
+                            selection_value,
+                            development_ranking,
+                        )
+                        _, selected_checkpoint_metadata = (
+                            best_checkpoint_metadata(
+                                args.checkpoint_dir, run_signature
+                            )
+                        )
+
+                should_save_recovery = (
+                    args.checkpoint_dir is not None
+                    and (
+                        global_step % args.checkpoint_every_steps == 0
+                        or should_evaluate_development
+                    )
+                )
+                if should_save_recovery:
+                    save_training_checkpoint(
+                        args.checkpoint_dir,
+                        run_signature,
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        CheckpointProgress(
+                            epoch_index=epoch,
+                            next_batch_index=batch_index,
+                            global_step=global_step,
+                            training_history=list(training_history),
+                            accumulated_loss=accumulated_loss,
+                            correct_pairs=correct_pairs,
+                            observed_pairs=observed_pairs,
+                            pair_type_counts=dict(pair_type_counts),
+                            selection_history=list(selection_history),
+                        ),
+                        args.checkpoints_to_keep,
+                    )
         training_history.append(
             {
                 "epoch": epoch + 1,
-                "mean_ranknet_loss": accumulated_loss / len(train_loader),
+                "mean_ranknet_loss": accumulated_loss / total_epoch_batches,
                 "pair_accuracy": correct_pairs / observed_pairs,
                 "sampled_pair_count": len(epoch_pairs),
                 "pair_type_counts": dict(sorted(pair_type_counts.items())),
                 "optimizer_steps_total": global_step,
             }
         )
-
-    # Pointwise evaluation matches serving: score once, group, sort, measure.
-    model.eval()
-    gold_labels: list[str] = []
-    query_ids: list[Any] = []
-    product_ids: list[str] = []
-    yes_logits: list[float] = []
-    no_logits: list[float] = []
-    ranking_scores: list[float] = []
-    with torch.inference_mode():
-        for batch in tqdm(eval_loader, desc="evaluate"):
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                logits, scores = forward_yes_no(
-                    model,
-                    input_ids,
-                    attention_mask,
-                    yes_no_token_tensor,
-                )
-            cpu_logits = logits.float().cpu()
-            yes_logits.extend(cpu_logits[:, 0].tolist())
-            no_logits.extend(cpu_logits[:, 1].tolist())
-            ranking_scores.extend(scores.float().cpu().tolist())
-            gold_labels.extend(batch["gold_labels"])
-            query_ids.extend(batch["query_ids"])
-            product_ids.extend(batch["product_ids"])
-
-    ranking, per_query = ranking_metrics(
-        query_ids, gold_labels, ranking_scores, args.ndcg_k
-    )
-    metrics = {
-        "training": {"epochs": training_history},
-        "ranking": ranking,
-        "configuration": {
-            "objective": "ranknet_pairwise",
-            "score": "yes_logit - no_logit",
-            "prompt_version": "esci_v1",
-            "prompt_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
-            "label_order": list(LABEL_ORDER),
-            "graded_relevance": GRADE,
-            "direct_relevant_labels": sorted(DIRECT_RELEVANT),
-            "broad_relevant_labels": sorted(BROAD_RELEVANT),
-            "train_products": len(train_frame),
-            "train_queries": int(train_frame["query_id"].nunique()),
-            "eval_products": len(eval_frame),
-            "eval_queries": int(eval_frame["query_id"].nunique()),
-            "pairs_per_query": args.pairs_per_query,
-            "pair_weighting": args.pair_weighting,
-            "max_length": args.max_length,
-            "epochs": args.epochs,
-            "learning_rate": args.learning_rate,
-            "lora_rank": args.lora_rank,
-            "lora_alpha": args.lora_alpha,
-            "lora_dropout": args.lora_dropout,
-            "seed": args.seed,
-        },
-    }
-    print(json.dumps(metrics, indent=2))
-
-    args.metrics_output.mkdir(parents=True, exist_ok=True)
-    (args.metrics_output / "metrics.json").write_text(
-        json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    with (args.metrics_output / "per_query_metrics.jsonl").open(
-        "w", encoding="utf-8"
-    ) as handle:
-        for row in per_query:
-            handle.write(json.dumps(row, sort_keys=True) + "\n")
-
-    # sigmoid(score) is a useful diagnostic, but RankNet does not calibrate it.
-    yes_probability = [
-        1.0 / (1.0 + math.exp(-max(min(score, 60.0), -60.0)))
-        for score in ranking_scores
-    ]
-    prediction_frame = pd.DataFrame(
-        {
-            "query_id": query_ids,
-            "product_id": product_ids,
-            "gold_label": gold_labels,
-            "yes_logit": yes_logits,
-            "no_logit": no_logits,
-            "ranking_score": ranking_scores,
-            "yes_probability_uncalibrated": yes_probability,
-        }
-    )
-    prediction_frame["predicted_rank"] = (
-        prediction_frame.groupby("query_id")["ranking_score"]
-        .rank(method="first", ascending=False)
-        .astype(int)
-    )
-    prediction_frame.to_parquet(
-        args.metrics_output / "predictions.parquet", index=False
-    )
-
-    if mlflow is None:
-        print("warning: MLflow is not installed; metrics remain in the AML output")
-    else:
-        try:
-            mlflow.log_metrics(
-                flatten_metrics(
-                    {
-                        "ranking": ranking,
-                        "final_training": {
-                            "mean_ranknet_loss": training_history[-1][
-                                "mean_ranknet_loss"
-                            ],
-                            "pair_accuracy": training_history[-1][
-                                "pair_accuracy"
-                            ],
-                        },
-                    }
-                )
+        # Always persist a clean epoch boundary. If eviction occurred after the
+        # last periodic checkpoint but before this write, the retry finishes
+        # only the missing tail and then creates this boundary checkpoint.
+        if args.checkpoint_dir is not None:
+            save_training_checkpoint(
+                args.checkpoint_dir,
+                run_signature,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                CheckpointProgress(
+                    epoch_index=epoch + 1,
+                    next_batch_index=0,
+                    global_step=global_step,
+                    training_history=list(training_history),
+                    selection_history=list(selection_history),
+                ),
+                args.checkpoints_to_keep,
             )
-            mlflow.log_artifacts(
-                str(args.metrics_output), artifact_path="evaluation"
-            )
-        except Exception as exc:
-            print(f"warning: MLflow logging was unavailable: {exc}")
 
+    if development_loader is not None:
+        _, selected_checkpoint_metadata = load_best_model_checkpoint(
+            args.checkpoint_dir, run_signature, model
+        )
+        print(
+            "Final evaluation and export will use the selected best adapter, "
+            "not necessarily the latest recovery state.",
+            flush=True,
+        )
+
+    metrics = evaluate_and_write_outputs(
+        args,
+        model,
+        eval_loader,
+        device,
+        yes_no_token_tensor,
+        eval_frame,
+        instruction,
+        training_history,
+        train_frame,
+        selection_history=selection_history,
+        selected_checkpoint=selected_checkpoint_metadata,
+    )
+
+    # model_output was validated above for every non-evaluation-only run.
     args.model_output.mkdir(parents=True, exist_ok=True)
     adapter_dir = args.model_output / "adapter"
     merged_dir = args.model_output / "merged"
+    model.eval()
     model.save_pretrained(adapter_dir, safe_serialization=True)
     merged_model = model.merge_and_unload()
     merged_model.config.use_cache = True
     merged_model.save_pretrained(merged_dir, safe_serialization=True)
     tokenizer.save_pretrained(merged_dir)
     shutil.copy2(args.prompt_file, args.model_output / "esci_v1.txt")
+    if args.experiment_config_file is not None:
+        shutil.copy2(
+            args.experiment_config_file,
+            args.model_output / "experiment_config_source.yaml",
+        )
     (args.model_output / "training_metadata.json").write_text(
         json.dumps(metrics["configuration"], indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (args.model_output / "model_selection.json").write_text(
+        json.dumps(metrics["model_selection"], indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     print(f"Saved LoRA adapter and merged model to {args.model_output}")

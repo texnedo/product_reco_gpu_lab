@@ -3,6 +3,7 @@
 
 # Generated data and temporary upload staging.
 artifacts/
+run_results/
 .aml-staging/
 
 # Python/editor state.

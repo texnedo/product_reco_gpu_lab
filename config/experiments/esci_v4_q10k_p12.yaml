@@ -1,0 +1,65 @@
+schema_version: 1
+
+run:
+  label: v4-q10k
+  aml_experiment_name: qwen-esci-reranker
+
+assets:
+  data: azureml:esci-ranking:1
+  model: azureml:qwen3-reranker-0-6b:1
+
+prompt:
+  file: config/prompts/esci_v1.txt
+
+preprocessing:
+  # Remove HTML and normalize whitespace. Field order, repeated sentences, and
+  # the 512-token right-truncation policy remain unchanged.
+  text_cleaning: basic_v1
+
+data:
+  # Double query diversity while retaining the original 12-pair/query budget.
+  train_queries: 10000
+  eval_queries: 1000
+  small_version: true
+
+model:
+  max_length: 512
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+
+training:
+  epochs: 1
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0002
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  pair_weighting: none
+
+sampling:
+  # Keep the v1 sampler so this run tests broader data plus added compute.
+  strategy: query_round_robin
+  pairs_per_query: 12
+  balance_fraction: 0.0
+  balanced_pairs_per_type_per_query: 12
+
+evaluation:
+  batch_size: 8
+  ndcg_k: 10
+  # This stable subset is evaluated at step zero, every 625 optimizer steps,
+  # and the final step. The highest development NDCG adapter is exported.
+  selection_queries: 250
+  selection_every_steps: 625
+  selection_min_delta: 0.0
+
+checkpoint:
+  every_steps: 25
+  keep: 3
+  resume: true
+
+runtime:
+  num_workers: 2
+  seed: 42

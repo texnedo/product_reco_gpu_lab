@@ -1,0 +1,63 @@
+schema_version: 1
+
+run:
+  label: v3-balanced
+  aml_experiment_name: qwen-esci-reranker
+
+assets:
+  data: azureml:esci-ranking:1
+  model: azureml:qwen3-reranker-0-6b:1
+
+prompt:
+  file: config/prompts/esci_v1.txt
+
+preprocessing:
+  text_cleaning: none
+
+data:
+  train_queries: 5000
+  eval_queries: 1000
+  small_version: true
+
+model:
+  max_length: 512
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+
+training:
+  # Keep the successful v1 optimization budget; change only the sampler.
+  epochs: 1
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0002
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  pair_weighting: none
+
+sampling:
+  # Half of the examples preserve per-query round-robin behavior. The other
+  # half is divided globally across E>S, E>C, E>I, S>C, S>I, and C>I.
+  strategy: mixed_type_balanced
+  pairs_per_query: 12
+  balance_fraction: 0.5
+  # Prevent a small number of C-containing queries from dominating a type.
+  balanced_pairs_per_type_per_query: 12
+
+evaluation:
+  batch_size: 8
+  ndcg_k: 10
+  selection_queries: 0
+  selection_every_steps: 0
+  selection_min_delta: 0.0
+
+checkpoint:
+  every_steps: 25
+  keep: 3
+  resume: true
+
+runtime:
+  num_workers: 2
+  seed: 42
