@@ -192,9 +192,10 @@ def validate_experiment_config(config: ExperimentConfig) -> ExperimentConfig:
         raise ValueError(
             "evaluation.selection_min_delta requires model selection to be enabled"
         )
-    if config.selection_queries > config.eval_queries:
+    if config.selection_queries >= config.eval_queries:
         raise ValueError(
-            "evaluation.selection_queries cannot exceed data.eval_queries"
+            "evaluation.selection_queries must leave at least one final "
+            "holdout query"
         )
     if not 0.0 <= config.balance_fraction <= 1.0:
         raise ValueError("sampling.balance_fraction must be in [0, 1]")
@@ -343,8 +344,12 @@ def _float_slug(value: float) -> str:
 def generated_display_name(config: ExperimentConfig, eval_only: bool) -> str:
     """Build an AML-safe name whose important experimental variables are visible."""
     if eval_only:
+        final_queries = config.eval_queries - config.selection_queries
+        evaluation_slug = f"eval{final_queries}"
+        if config.selection_queries:
+            evaluation_slug += f"-dev{config.selection_queries}"
         name = (
-            f"qwen-esci-{config.run_label}-base-eval{config.eval_queries}"
+            f"qwen-esci-{config.run_label}-base-{evaluation_slug}"
             f"-ml{config.max_length}-s{config.seed}"
         )
     else:
@@ -363,6 +368,11 @@ def generated_display_name(config: ExperimentConfig, eval_only: bool) -> str:
     if config.text_cleaning != "none":
         cleaning_slug = config.text_cleaning.replace("basic_v", "clean")
         name = f"{name}-{cleaning_slug}"
+    if not eval_only and config.selection_queries:
+        final_queries = config.eval_queries - config.selection_queries
+        name = (
+            f"{name}-dev{config.selection_queries}-h{final_queries}"
+        )
     if len(name) > 255:
         raise ValueError("Generated AML display name exceeds 255 characters")
     return name

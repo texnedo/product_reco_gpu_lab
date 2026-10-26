@@ -68,34 +68,34 @@ Same-label pairs are not constrained because ESCI provides no ordering within
 a label.
 
 Experiment and learning settings live in versioned YAML files under
-`config/experiments/`. The first three configs reproduce completed runs; v4 is
-the next broader-data experiment:
+`config/experiments/`. The first four configs reproduce completed runs; v5 is
+the next controlled learning-rate experiment:
 
 | Config | Sampler | Purpose |
 |---|---|---|
-| `esci_v1_12_pairs.yaml` | per-query round robin, 12 pairs | best NDCG and broad metrics |
+| `esci_v1_12_pairs.yaml` | per-query round robin, 12 pairs | strong broad-relevance incumbent |
 | `esci_v2_24_pairs.yaml` | per-query round robin, 24 pairs | more updates; worse held-out ranking |
 | `esci_v3_balanced.yaml` | 50% round robin + 50% globally type-balanced | tied overall; stronger rare boundaries |
-| `esci_v4_q10k_p12.yaml` | per-query round robin, 12 pairs, 10,000 queries | broader run, basic text cleaning, development model selection |
+| `esci_v4_q10k_p12.yaml` | per-query round robin, 12 pairs, 10,000 queries | broader run, basic text cleaning, best-checkpoint selection |
+| `esci_v5_lr1e4.yaml` | same as v4, learning rate `1e-4` | disjoint dev/holdout and controlled lower-rate test |
 
 See [`docs/esci_experiment_report.md`](docs/esci_experiment_report.md) for the
-aggregate, paired-query, and label-boundary comparison of the base model and
-all three LoRA runs.
+aggregate, paired-query, holdout, label-boundary, and training-trajectory
+comparison of the base model and all four LoRA runs.
 
-Submit v4 after both input assets are registered. It is the default config, so
-the two commands below are equivalent:
+Submit v5 after both input assets are registered. The experiment config is
+required explicitly so changing or adding configs cannot silently alter a run:
 
 ```bash
 source local.aml.env
-python jobs/submit_train_esci.py
 python jobs/submit_train_esci.py \
-    --config config/experiments/esci_v4_q10k_p12.yaml
+    --config config/experiments/esci_v5_lr1e4.yaml
 ```
 
 The generated AML display name exposes the important resolved values:
 
 ```text
-qwen-esci-v4-q10k-rr-p12-e1-b4-ga8-lr2e-4-r16-s42-clean1
+qwen-esci-v5-q10k-rr-p12-e1-b4-ga8-lr1e-4-r16-s42-clean1-dev250-h750
 ```
 
 Here `q10k` records query breadth, `rr` is round-robin sampling, `p12` is the
@@ -108,6 +108,9 @@ preserves repeated sentences before token truncation. It does not remove
 stopwords, cap or reorder fields, so the 512-token budget and existing
 serializer priority remain unchanged. Override
 only the run display with `--display-name` when necessary.
+`dev250-h750` makes the leakage-free evaluation protocol explicit: 250 stable
+queries select the checkpoint and a disjoint 750-query holdout supplies final
+metrics and predictions.
 
 CLI learning options remain available as explicit overrides, but their
 defaults are `None`, so choosing a YAML never silently inherits old CLI
@@ -115,15 +118,15 @@ defaults. Prefer copying a YAML for durable experiments:
 
 ```bash
 python jobs/submit_train_esci.py \
-    --config config/experiments/esci_v4_q10k_p12.yaml \
-    --learning-rate 0.0001
+    --config config/experiments/esci_v5_lr1e4.yaml \
+    --learning-rate 0.00005
 ```
 
 Validate the resolved name and trainer command without contacting Azure:
 
 ```bash
 python jobs/submit_train_esci.py \
-    --config config/experiments/esci_v4_q10k_p12.yaml \
+    --config config/experiments/esci_v5_lr1e4.yaml \
     --dry-run
 ```
 
@@ -132,7 +135,7 @@ same test-query sample and with the same prompt and scoring code:
 
 ```bash
 python jobs/submit_train_esci.py \
-    --config config/experiments/esci_v4_q10k_p12.yaml \
+    --config config/experiments/esci_v5_lr1e4.yaml \
     --eval-only
 ```
 
@@ -142,7 +145,8 @@ state, write checkpoints, or export a model. Its only AML output is
 a base-model evaluation.
 `metrics.json` identifies it with `run_mode: base_model_evaluation` and
 `model_variant: unmodified_base_model`, so it cannot be mistaken for a
-zero-epoch training run.
+zero-epoch training run. It uses the same deterministic 250/750 split as
+training and reports only the untouched 750-query holdout as final ranking.
 
 The balanced config keeps the successful v1 budget: 59,982 unique pairs and
 1,875 optimizer steps on the current 5,000-query selection. Half of the sample
@@ -152,13 +156,13 @@ queries from dominating. On the current data this changes the pair mix from
 48.5% `E>S` and 2.9% `C>I` to approximately 32.5% and 9.8%, respectively,
 without changing the total training or optimizer-step counts.
 
-V4 selects 119,959 pairs from 10,000 queries and performs 3,749 optimizer
+V5 selects 119,959 pairs from 10,000 queries and performs 3,749 optimizer
 steps. A stable 250-query subset of the 1,000 evaluation queries is scored at
 step zero, every 625 optimizer steps, and the final step. Development NDCG@10
 is logged to MLflow. Whenever it improves, the job writes a complete best
 checkpoint containing LoRA, optimizer, scheduler, GradScaler, RNG, and exact
 progress state. At the end, the trainer reloads this best adapter before the
-full evaluation and merged-model export.
+disjoint 750-query final evaluation and merged-model export.
 
 The submission script creates the immutable `qwen-esci-training:1` environment
 from `environments/train/` the first time it runs. The job consumes:
@@ -171,7 +175,8 @@ azureml:qwen3-reranker-0-6b:1
 The training mode emits three AML outputs:
 
 - `trained_model`: the LoRA adapter and a merged, self-contained model;
-- `evaluation`: aggregate metrics, per-query metrics, and product scores;
+- `evaluation`: 750-query holdout aggregate/per-query metrics, product scores,
+  and `evaluation_split.json` listing both disjoint query-ID sets;
 - `checkpoints`: durable LoRA, optimizer, scheduler, GradScaler, RNG, epoch,
   and batch state used both for preemption recovery and best-model selection.
 

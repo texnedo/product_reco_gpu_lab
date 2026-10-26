@@ -12,6 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from esci_core import (  # noqa: E402
     GRADE,
     clean_product_text,
+    development_query_ids,
     product_document,
     ranking_metrics,
     sample_training_pairs,
@@ -59,6 +60,23 @@ class ProductTextCleaningTests(unittest.TestCase):
     def test_unknown_cleaning_mode_fails_loudly(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown text cleaning mode"):
             clean_product_text("text", "future_mode")
+
+
+class EvaluationSplitTests(unittest.TestCase):
+    def test_development_ids_are_stable_disjoint_and_order_independent(self) -> None:
+        query_ids = list(range(1000))
+        first = development_query_ids(query_ids, 250, seed=42)
+        repeated = development_query_ids(reversed(query_ids), 250, seed=42)
+        holdout = set(query_ids) - set(first)
+
+        self.assertEqual(first, repeated)
+        self.assertEqual(len(first), 250)
+        self.assertEqual(len(holdout), 750)
+        self.assertFalse(set(first) & holdout)
+
+    def test_development_ids_must_leave_a_final_holdout(self) -> None:
+        with self.assertRaisesRegex(ValueError, "holdout"):
+            development_query_ids(range(10), 10, seed=42)
 
 
 class PairSamplingTests(unittest.TestCase):

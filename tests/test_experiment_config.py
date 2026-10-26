@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 
 
@@ -19,7 +20,7 @@ from experiment_config import (  # noqa: E402
 class ExperimentConfigTests(unittest.TestCase):
     def test_all_checked_in_configs_are_valid(self) -> None:
         configs = sorted((PROJECT_ROOT / "config/experiments").glob("*.yaml"))
-        self.assertEqual(len(configs), 4)
+        self.assertEqual(len(configs), 5)
         for path in configs:
             with self.subTest(path=path.name):
                 self.assertEqual(load_experiment_config(path).source_path, path)
@@ -67,11 +68,40 @@ class ExperimentConfigTests(unittest.TestCase):
         self.assertEqual(config.text_cleaning, "basic_v1")
         self.assertEqual(
             generated_display_name(config, eval_only=False),
-            "qwen-esci-v4-q10k-rr-p12-e1-b4-ga8-lr2e-4-r16-s42-clean1",
+            "qwen-esci-v4-q10k-rr-p12-e1-b4-ga8-lr2e-4-r16-s42-clean1-dev250-h750",
         )
 
         with self.assertRaisesRegex(ValueError, "must both be positive"):
             apply_overrides(config, {"selection_every_steps": 0})
+
+    def test_v5_changes_only_the_intended_learning_rate(self) -> None:
+        v4 = load_experiment_config(
+            PROJECT_ROOT / "config/experiments/esci_v4_q10k_p12.yaml"
+        )
+        v5 = load_experiment_config(
+            PROJECT_ROOT / "config/experiments/esci_v5_lr1e4.yaml"
+        )
+
+        self.assertEqual(v5.learning_rate, 1e-4)
+        self.assertEqual(v5.pairs_per_query, 12)
+        self.assertEqual(v5.train_queries, 10_000)
+        self.assertEqual(v5.selection_queries, 250)
+        self.assertEqual(v5.eval_queries - v5.selection_queries, 750)
+        self.assertEqual(v5.text_cleaning, v4.text_cleaning)
+        v4_comparable = asdict(v4)
+        v5_comparable = asdict(v5)
+        for key in ("source_path", "source_sha256", "run_label", "learning_rate"):
+            v4_comparable.pop(key)
+            v5_comparable.pop(key)
+        self.assertEqual(v5_comparable, v4_comparable)
+        self.assertEqual(
+            generated_display_name(v5, eval_only=False),
+            "qwen-esci-v5-q10k-rr-p12-e1-b4-ga8-lr1e-4-r16-s42-clean1-dev250-h750",
+        )
+        self.assertEqual(
+            generated_display_name(v5, eval_only=True),
+            "qwen-esci-v5-q10k-base-eval750-dev250-ml512-s42-clean1",
+        )
 
     def test_rejects_incomplete_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

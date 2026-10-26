@@ -19,9 +19,6 @@ from azure.identity import AzureCliCredential
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENVIRONMENT_CONTEXT = PROJECT_ROOT / "environments" / "train"
-DEFAULT_EXPERIMENT_CONFIG = (
-    PROJECT_ROOT / "config" / "experiments" / "esci_v4_q10k_p12.yaml"
-)
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from experiment_config import (  # noqa: E402
@@ -46,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_EXPERIMENT_CONFIG,
-        help="Versioned experiment YAML (default: esci_v4_q10k_p12.yaml).",
+        required=True,
+        help="Versioned experiment YAML; required to prevent accidental runs.",
     )
     parser.add_argument("--data-asset")
     parser.add_argument("--model-asset")
@@ -242,6 +239,9 @@ def main() -> int:
         f"--text-cleaning {config.text_cleaning} "
         f"--eval-batch-size {config.eval_batch_size} "
         f"--ndcg-k {config.ndcg_k} "
+        f"--selection-queries {config.selection_queries} "
+        f"--selection-every-steps {config.selection_every_steps} "
+        f"--selection-min-delta {config.selection_min_delta} "
         f"--num-workers {config.num_workers} "
         f"--seed {config.seed} "
         + ("--small-version" if config.small_version else "--no-small-version")
@@ -271,9 +271,6 @@ def main() -> int:
             f" --pair-weighting {config.pair_weighting}"
             f" --checkpoint-every-steps {config.checkpoint_every_steps}"
             f" --checkpoints-to-keep {config.checkpoints_to_keep}"
-            f" --selection-queries {config.selection_queries}"
-            f" --selection-every-steps {config.selection_every_steps}"
-            f" --selection-min-delta {config.selection_min_delta}"
             + (" --resume" if config.resume else " --no-resume")
         )
         outputs.update(

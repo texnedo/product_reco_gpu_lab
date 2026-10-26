@@ -7,6 +7,7 @@ Transformers, PEFT, CUDA discovery, or Azure ML integrations.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 import re
@@ -129,6 +130,33 @@ def product_document(
         "Description: "
         f"{clean_product_text(row['product_description'], text_cleaning)}"
     )
+
+
+def development_query_ids(
+    query_ids: Iterable[Any], query_count: int, seed: int
+) -> tuple[Any, ...]:
+    """Select stable development IDs without depending on dataframe order.
+
+    The final holdout is the complement of these IDs. Hashing avoids consuming
+    training RNG state and makes training and evaluation-only jobs use exactly
+    the same split.
+    """
+    unique_query_ids = set(query_ids)
+    if query_count < 0 or query_count >= len(unique_query_ids):
+        raise ValueError(
+            "query_count must be non-negative and leave at least one holdout query"
+        )
+    ordered = sorted(
+        unique_query_ids,
+        key=lambda query_id: (
+            hashlib.sha256(
+                f"{seed}:development:{query_id}".encode("utf-8")
+            ).digest(),
+            type(query_id).__name__,
+            repr(query_id),
+        ),
+    )
+    return tuple(ordered[:query_count])
 
 
 def _pairs_for_type(

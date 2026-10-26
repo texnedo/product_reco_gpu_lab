@@ -73,6 +73,7 @@ from esci_core import (
     LABEL_ORDER,
     TEXT_CLEANING_MODES,
     TrainingPair,
+    development_query_ids,
     flatten_metrics,
     product_document,
     ranking_metrics,
@@ -103,6 +104,11 @@ def selection_history_sort_key(row: dict[str, Any]) -> int:
     return int(row["optimizer_step"])
 
 
+def json_scalar(value: Any) -> Any:
+    """Convert numpy/pandas scalar IDs to values accepted by json.dumps."""
+    return value.item() if hasattr(value, "item") else value
+
+
 # Native Qwen3-Reranker prompt contract. The contents of esci_v1.txt become
 # <Instruct>; they explain what "meets the requirements" means for products.
 RERANKER_PREFIX = (
@@ -122,6 +128,7 @@ def training_run_configuration(
     train_frame: Any,
     initial_pair_count: int,
     development_frame: Any = None,
+    final_evaluation_frame: Any = None,
 ) -> dict[str, Any]:
     """Describe every setting that must match when state is restored."""
     training_rows = hashlib.sha256()
@@ -147,12 +154,23 @@ def training_run_configuration(
                 f"{query_id!r}\0{product_id!r}\0{label}\n".encode("utf-8")
             )
         development_rows_hash = development_rows.hexdigest()
+    final_evaluation_rows_hash = None
+    if final_evaluation_frame is not None:
+        final_evaluation_rows = hashlib.sha256()
+        for query_id, product_id, label in final_evaluation_frame[
+            ["query_id", "product_id", "esci_label"]
+        ].itertuples(index=False, name=None):
+            final_evaluation_rows.update(
+                f"{query_id!r}\0{product_id!r}\0{label}\n".encode("utf-8")
+            )
+        final_evaluation_rows_hash = final_evaluation_rows.hexdigest()
     return {
         "prompt_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
         "model_config_sha256": model_config_hash,
         "training_rows_sha256": training_rows.hexdigest(),
         "initial_pair_count": initial_pair_count,
         "development_rows_sha256": development_rows_hash,
+        "final_evaluation_rows_sha256": final_evaluation_rows_hash,
         "epochs": args.epochs,
         "max_length": args.max_length,
         "text_cleaning": args.text_cleaning,
@@ -544,29 +562,31 @@ def load_split(
     return frame
 
 
-def select_development_frame(
+def split_evaluation_frames(
     eval_frame: Any, query_count: int, seed: int
-) -> Any:
-    """Choose a stable complete-query subset from the larger evaluation frame."""
-    query_ids = list(eval_frame["query_id"].unique())
-    hashed_query_ids = sorted(
-        (
-            hashlib.sha256(
-                f"{seed}:development:{query_id}".encode("utf-8")
-            ).digest(),
-            query_id,
-        )
-        for query_id in query_ids
+) -> tuple[Any, Any]:
+    """Split complete query groups into development and untouched holdout."""
+    selected = set(
+        development_query_ids(eval_frame["query_id"], query_count, seed)
     )
-    ordered = [query_id for _, query_id in hashed_query_ids]
-    selected = set(ordered[:query_count])
-    frame = eval_frame[eval_frame["query_id"].isin(selected)].copy()
+    development_frame = eval_frame[eval_frame["query_id"].isin(selected)].copy()
+    final_evaluation_frame = eval_frame[
+        ~eval_frame["query_id"].isin(selected)
+    ].copy()
+    overlap = set(development_frame["query_id"]) & set(
+        final_evaluation_frame["query_id"]
+    )
+    if overlap or final_evaluation_frame.empty:
+        raise RuntimeError("Development/final evaluation split is invalid")
     print(
-        f"Selected development subset: {frame['query_id'].nunique():,} queries, "
-        f"{len(frame):,} products",
+        "Evaluation protocol: "
+        f"development={development_frame['query_id'].nunique():,} queries/"
+        f"{len(development_frame):,} products, "
+        f"final_holdout={final_evaluation_frame['query_id'].nunique():,} queries/"
+        f"{len(final_evaluation_frame):,} products",
         flush=True,
     )
-    return frame
+    return development_frame, final_evaluation_frame
 
 
 def score_product_loader(
@@ -673,6 +693,8 @@ def evaluate_and_write_outputs(
     instruction: str,
     training_history: list[dict[str, Any]],
     train_frame: Any = None,
+    evaluation_pool_frame: Any = None,
+    development_frame: Any = None,
     selection_history: Optional[list[dict[str, Any]]] = None,
     selected_checkpoint: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
@@ -682,7 +704,7 @@ def evaluate_and_write_outputs(
         eval_loader,
         device,
         yes_no_token_tensor,
-        description="final evaluation",
+        description="final holdout evaluation",
     )
     gold_labels = scored["gold_labels"]
     query_ids = scored["query_ids"]
@@ -694,6 +716,18 @@ def evaluate_and_write_outputs(
     ranking, per_query = ranking_metrics(
         query_ids, gold_labels, ranking_scores, args.ndcg_k
     )
+    evaluation_pool_frame = (
+        eval_frame if evaluation_pool_frame is None else evaluation_pool_frame
+    )
+    development_query_count = (
+        0
+        if development_frame is None
+        else int(development_frame["query_id"].nunique())
+    )
+    development_query_set = (
+        set() if development_frame is None else set(development_frame["query_id"])
+    )
+    final_evaluation_query_set = set(eval_frame["query_id"])
     configuration = {
         "run_mode": "base_model_evaluation" if args.eval_only else "lora_training",
         "model_variant": (
@@ -711,6 +745,26 @@ def evaluate_and_write_outputs(
         "train_queries": (
             0 if train_frame is None else int(train_frame["query_id"].nunique())
         ),
+        "evaluation_protocol": (
+            "all_queries"
+            if development_frame is None
+            else "disjoint_development_holdout"
+        ),
+        "evaluation_pool_products": len(evaluation_pool_frame),
+        "evaluation_pool_queries": int(
+            evaluation_pool_frame["query_id"].nunique()
+        ),
+        "development_products": (
+            0 if development_frame is None else len(development_frame)
+        ),
+        "development_queries": development_query_count,
+        "final_evaluation_products": len(eval_frame),
+        "final_evaluation_queries": int(eval_frame["query_id"].nunique()),
+        "development_final_query_overlap": len(
+            development_query_set & final_evaluation_query_set
+        ),
+        # Retain these names for compatibility; they now refer exclusively to
+        # the untouched final holdout when development selection is enabled.
         "eval_products": len(eval_frame),
         "eval_queries": int(eval_frame["query_id"].nunique()),
         "max_length": args.max_length,
@@ -727,6 +781,9 @@ def evaluate_and_write_outputs(
         ),
         "experiment_config_sha256": experiment_config_sha256(args),
         "run_display_name": args.run_display_name,
+        "selection_queries": args.selection_queries,
+        "selection_every_steps": args.selection_every_steps,
+        "selection_min_delta": args.selection_min_delta,
     }
     if not args.eval_only:
         configuration.update(
@@ -748,9 +805,6 @@ def evaluate_and_write_outputs(
                 "lora_rank": args.lora_rank,
                 "lora_alpha": args.lora_alpha,
                 "lora_dropout": args.lora_dropout,
-                "selection_queries": args.selection_queries,
-                "selection_every_steps": args.selection_every_steps,
-                "selection_min_delta": args.selection_min_delta,
             }
         )
     metrics = {
@@ -769,6 +823,35 @@ def evaluate_and_write_outputs(
     args.metrics_output.mkdir(parents=True, exist_ok=True)
     (args.metrics_output / "metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    development_query_ids_json = (
+        []
+        if development_frame is None
+        else sorted(
+            json_scalar(value)
+            for value in development_frame["query_id"].unique()
+        )
+    )
+    final_query_ids_json = sorted(
+        json_scalar(value) for value in eval_frame["query_id"].unique()
+    )
+    split_manifest = {
+        "protocol": configuration["evaluation_protocol"],
+        "seed": args.seed,
+        "evaluation_pool_query_count": configuration[
+            "evaluation_pool_queries"
+        ],
+        "development_query_count": len(development_query_ids_json),
+        "final_evaluation_query_count": len(final_query_ids_json),
+        "overlap_query_count": len(
+            development_query_set & final_evaluation_query_set
+        ),
+        "development_query_ids": development_query_ids_json,
+        "final_evaluation_query_ids": final_query_ids_json,
+    }
+    (args.metrics_output / "evaluation_split.json").write_text(
+        json.dumps(split_manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     with (args.metrics_output / "per_query_metrics.jsonl").open(
         "w", encoding="utf-8"
@@ -972,15 +1055,17 @@ def main() -> int:
     if not args.eval_only and args.model_output is None:
         raise ValueError("--model-output is required unless --eval-only is set")
     selection_enabled = args.selection_queries > 0 or args.selection_every_steps > 0
-    if not args.eval_only and selection_enabled:
+    if selection_enabled:
         if args.selection_queries <= 0 or args.selection_every_steps <= 0:
             raise ValueError(
                 "--selection-queries and --selection-every-steps must both be "
                 "positive when model selection is enabled"
             )
-        if args.selection_queries > args.eval_queries:
-            raise ValueError("--selection-queries cannot exceed --eval-queries")
-        if args.checkpoint_dir is None:
+        if args.selection_queries >= args.eval_queries:
+            raise ValueError(
+                "--selection-queries must leave at least one final holdout query"
+            )
+        if not args.eval_only and args.checkpoint_dir is None:
             raise ValueError(
                 "--checkpoint-dir is required for durable best-model selection"
             )
@@ -1023,9 +1108,15 @@ def main() -> int:
         train_frame = load_split(
             args.data_dir, "train", args.train_queries, args.small_version, args.seed
         )
-    eval_frame = load_split(
+    evaluation_pool_frame = load_split(
         args.data_dir, "test", args.eval_queries, args.small_version, args.seed
     )
+    development_frame = None
+    final_evaluation_frame = evaluation_pool_frame
+    if selection_enabled:
+        development_frame, final_evaluation_frame = split_evaluation_frames(
+            evaluation_pool_frame, args.selection_queries, args.seed
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
     if tokenizer.pad_token_id is None:
@@ -1039,7 +1130,10 @@ def main() -> int:
 
     prompt_encoding = PromptEncoding.build(tokenizer, instruction, args.max_length)
     eval_products = ProductDataset(
-        eval_frame, tokenizer, prompt_encoding, args.text_cleaning
+        final_evaluation_frame,
+        tokenizer,
+        prompt_encoding,
+        args.text_cleaning,
     )
     product_collator = ProductCollator(tokenizer.pad_token_id)
 
@@ -1051,12 +1145,8 @@ def main() -> int:
         num_workers=args.num_workers,
         pin_memory=True,
     )
-    development_frame = None
     development_loader = None
     if not args.eval_only and selection_enabled:
-        development_frame = select_development_frame(
-            eval_frame, args.selection_queries, args.seed
-        )
         development_loader = DataLoader(
             ProductDataset(
                 development_frame,
@@ -1091,9 +1181,11 @@ def main() -> int:
             eval_loader,
             device,
             yes_no_token_tensor,
-            eval_frame,
+            final_evaluation_frame,
             instruction,
             training_history=[],
+            evaluation_pool_frame=evaluation_pool_frame,
+            development_frame=development_frame,
         )
         return 0
 
@@ -1176,6 +1268,7 @@ def main() -> int:
         train_frame,
         len(initial_pairs),
         development_frame,
+        final_evaluation_frame,
     )
     run_signature = checkpoint_signature(run_configuration)
     checkpoint_progress = None
@@ -1569,10 +1662,12 @@ def main() -> int:
         eval_loader,
         device,
         yes_no_token_tensor,
-        eval_frame,
+        final_evaluation_frame,
         instruction,
         training_history,
         train_frame,
+        evaluation_pool_frame=evaluation_pool_frame,
+        development_frame=development_frame,
         selection_history=selection_history,
         selected_checkpoint=selected_checkpoint_metadata,
     )
