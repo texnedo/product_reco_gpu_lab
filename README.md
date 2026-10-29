@@ -68,8 +68,8 @@ Same-label pairs are not constrained because ESCI provides no ordering within
 a label.
 
 Experiment and learning settings live in versioned YAML files under
-`config/experiments/`. The first four configs reproduce completed runs; v5 is
-the next controlled learning-rate experiment:
+`config/experiments/`. All six configs reproduce completed runs; v6 is the
+current fixed-budget query-breadth incumbent:
 
 | Config | Sampler | Purpose |
 |---|---|---|
@@ -78,27 +78,28 @@ the next controlled learning-rate experiment:
 | `esci_v3_balanced.yaml` | 50% round robin + 50% globally type-balanced | tied overall; stronger rare boundaries |
 | `esci_v4_q10k_p12.yaml` | per-query round robin, 12 pairs, 10,000 queries | broader run, basic text cleaning, best-checkpoint selection |
 | `esci_v5_lr1e4.yaml` | same as v4, learning rate `1e-4` | disjoint dev/holdout and controlled lower-rate test |
+| `esci_v6_q20k_p6.yaml` | per-query round robin, 6 pairs, 20,000 queries | same pair budget across twice as many queries; best holdout metrics |
 
 See [`docs/esci_experiment_report.md`](docs/esci_experiment_report.md) for the
 aggregate, paired-query, holdout, label-boundary, and training-trajectory
-comparison of the base model and all four LoRA runs.
+comparison of the base model and all six LoRA runs.
 
-Submit v5 after both input assets are registered. The experiment config is
+Reproduce v6 after both input assets are registered. The experiment config is
 required explicitly so changing or adding configs cannot silently alter a run:
 
 ```bash
 source local.aml.env
 python jobs/submit_train_esci.py \
-    --config config/experiments/esci_v5_lr1e4.yaml
+    --config config/experiments/esci_v6_q20k_p6.yaml
 ```
 
 The generated AML display name exposes the important resolved values:
 
 ```text
-qwen-esci-v5-q10k-rr-p12-e1-b4-ga8-lr1e-4-r16-s42-clean1-dev250-h750
+qwen-esci-v6-q20k-rr-p6-e1-b4-ga8-lr1e-4-r16-s42-clean1-dev250-h750
 ```
 
-Here `q10k` records query breadth, `rr` is round-robin sampling, `p12` is the
+Here `q20k` records query breadth, `rr` is round-robin sampling, `p6` is the
 per-query pair budget, `b4/ga8` are batch and gradient accumulation, and the
 remaining segments record epochs, learning rate, LoRA rank, and seed. Azure
 ML's experiment name remains the stable `qwen-esci-reranker` group. `clean1`
@@ -163,6 +164,13 @@ is logged to MLflow. Whenever it improves, the job writes a complete best
 checkpoint containing LoRA, optimizer, scheduler, GradScaler, RNG, and exact
 progress state. At the end, the trainer reloads this best adapter before the
 disjoint 750-query final evaluation and merged-model export.
+
+V6 keeps that evaluation/checkpoint protocol and the same effective compute
+budget, but spreads 120,000 pairs across 20,000 queries at p6. Its selected
+step-2,500 checkpoint reaches 0.861641 NDCG@10 on the untouched holdout,
+versus 0.854425 for v5. The paired v6-minus-v5 interval is
+[+0.001716, +0.012530]; see the experiment report for the complete metric and
+boundary analysis.
 
 The submission script creates the immutable `qwen-esci-training:1` environment
 from `environments/train/` the first time it runs. The job consumes:

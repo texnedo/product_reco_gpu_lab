@@ -1,0 +1,63 @@
+schema_version: 1
+
+run:
+  label: v6-q20k
+  aml_experiment_name: qwen-esci-reranker
+
+assets:
+  data: azureml:esci-ranking:1
+  model: azureml:qwen3-reranker-0-6b:1
+
+prompt:
+  file: config/prompts/esci_v1.txt
+
+preprocessing:
+  # Preserve v5 preprocessing so query breadth is the intended change.
+  text_cleaning: basic_v1
+
+data:
+  # Use almost all 20,888 US small-version training queries. Six pairs per
+  # query keeps the total pair/update budget close to v5's 10k x 12 setup.
+  train_queries: 20000
+  # Keep v5's deterministic 250-development / 750-final evaluation protocol.
+  eval_queries: 1000
+  small_version: true
+
+model:
+  max_length: 512
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+
+training:
+  epochs: 1
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0001
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  pair_weighting: none
+
+sampling:
+  strategy: query_round_robin
+  pairs_per_query: 6
+  balance_fraction: 0.0
+  balanced_pairs_per_type_per_query: 12
+
+evaluation:
+  batch_size: 8
+  ndcg_k: 10
+  selection_queries: 250
+  selection_every_steps: 625
+  selection_min_delta: 0.0
+
+checkpoint:
+  every_steps: 25
+  keep: 3
+  resume: true
+
+runtime:
+  num_workers: 2
+  seed: 42

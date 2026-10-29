@@ -20,7 +20,7 @@ from experiment_config import (  # noqa: E402
 class ExperimentConfigTests(unittest.TestCase):
     def test_all_checked_in_configs_are_valid(self) -> None:
         configs = sorted((PROJECT_ROOT / "config/experiments").glob("*.yaml"))
-        self.assertEqual(len(configs), 5)
+        self.assertEqual(len(configs), 6)
         for path in configs:
             with self.subTest(path=path.name):
                 self.assertEqual(load_experiment_config(path).source_path, path)
@@ -101,6 +101,37 @@ class ExperimentConfigTests(unittest.TestCase):
         self.assertEqual(
             generated_display_name(v5, eval_only=True),
             "qwen-esci-v5-q10k-base-eval750-dev250-ml512-s42-clean1",
+        )
+
+    def test_v6_trades_pair_depth_for_query_breadth_at_fixed_budget(self) -> None:
+        v5 = load_experiment_config(
+            PROJECT_ROOT / "config/experiments/esci_v5_lr1e4.yaml"
+        )
+        v6 = load_experiment_config(
+            PROJECT_ROOT / "config/experiments/esci_v6_q20k_p6.yaml"
+        )
+
+        self.assertEqual(v6.train_queries, 20_000)
+        self.assertEqual(v6.pairs_per_query, 6)
+        self.assertEqual(
+            v6.train_queries * v6.pairs_per_query,
+            v5.train_queries * v5.pairs_per_query,
+        )
+        v5_comparable = asdict(v5)
+        v6_comparable = asdict(v6)
+        for key in (
+            "source_path",
+            "source_sha256",
+            "run_label",
+            "train_queries",
+            "pairs_per_query",
+        ):
+            v5_comparable.pop(key)
+            v6_comparable.pop(key)
+        self.assertEqual(v6_comparable, v5_comparable)
+        self.assertEqual(
+            generated_display_name(v6, eval_only=False),
+            "qwen-esci-v6-q20k-rr-p6-e1-b4-ga8-lr1e-4-r16-s42-clean1-dev250-h750",
         )
 
     def test_rejects_incomplete_yaml(self) -> None:

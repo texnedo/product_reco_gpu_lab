@@ -1,48 +1,44 @@
 # ESCI reranker experiment report
 
-This report compares the unmodified Qwen3-Reranker baseline with the first
-four LoRA experiments. All five archives are stored in `run_results/`.
+This report compares the unmodified Qwen3-Reranker baseline with the first six
+LoRA experiments. All seven archives are stored in `run_results/`.
 
 ## Executive summary
 
-- Pairwise LoRA training works: all four trained runs improve every reported
-  ranking metric over the archived base model.
-- V4 has the highest recorded 1,000-query NDCG@10 at 0.854258, but 250 of
-  those queries were used to select its checkpoint. On the untouched 750
-  queries, v4 NDCG is 0.850545 versus 0.850373 for v1: +0.000172 with a paired
-  95% interval of [-0.006370, +0.006651]. V4 is therefore tied with v1, not a
-  demonstrated NDCG winner.
-- V1 remains best on broad Precision@10 and Recall@10. V3 remains best on
-  direct Precision@10 and Recall@10. V4 therefore gains ordering quality
-  while giving back a small amount of top-ten recall.
-- The v3 balanced sampler is effectively tied with v1 at the query level.
-  Every paired 95% bootstrap confidence interval for v3 minus v1 contains
-  zero.
-- The sampler did change what the model learned. Pair-weighted ordering
-  accuracy improved by 2.74 percentage points for `S>C` and 3.46 points for
-  `C>I`, the two boundaries most underrepresented in v1. These improvements
-  are directional rather than statistically conclusive when queries are used
-  as the sampling unit.
-- Doubling the old sampler from 12 to 24 pairs per query reduced all ranking
-  metrics relative to v1. Its lower training loss and higher training pair
-  accuracy therefore did not generalize.
-- V4 development NDCG peaked at optimizer step 1,875 and declined afterward.
-  Best-checkpoint selection prevented the second half of the 3,749-step run
-  from degrading the exported model.
+- Pairwise LoRA training works: every trained run improves NDCG@10 over the
+  unmodified base model on the common holdout.
+- V6 is the new incumbent on all five 750-query holdout metrics. Its NDCG@10
+  is 0.861641, versus 0.854425 for v5 and 0.850373 for v1.
+- V6 minus v5 NDCG@10 is +0.007216 with a paired 95% interval of
+  [+0.001716, +0.012530]. Direct Precision@10 and Recall@10 also improve with
+  intervals entirely above zero. The smaller broad-metric gains remain
+  uncertain.
+- V6 holds the pair/update budget fixed: 20,000 queries x 6 pairs produces
+  120,000 pairs and 3,750 optimizer steps, versus v5's 10,000 x 12 setup with
+  119,959 pairs and 3,749 steps. The gain therefore supports query breadth and
+  candidate diversity rather than simply more optimization.
+- All six ESCI boundary accuracies improve from v5 to v6. `E>C` rises by 3.81
+  percentage points and `S>C` by 5.17 points; their query-clustered intervals
+  exclude zero.
+- V6 has the worst full-epoch training loss and pair accuracy among the recent
+  runs, yet the best holdout ranking. Training-pair optimization remains an
+  unreliable model-selection metric.
+- Best-checkpoint selection chose step 2,500. Four AML retries resumed from
+  durable checkpoints and preserved the best-model state, validating recovery
+  under repeated preemption.
 
-Retain v1 for broad top-ten retrieval and v3 when direct metrics or
-`S>C`/`C>I` separation are important; v4 is not a new general incumbent on the
-untouched holdout. V5 is prepared with the leakage-free 250-development /
-750-final split and lowers v4's peak learning rate from `2e-4` to `1e-4`.
-It deliberately keeps the p12 pair budget unchanged.
+Promote v6 as the current general ranking incumbent. Its advantage over v5 is
+supported on NDCG and direct relevance, while broad relevance is directionally
+better but not statistically resolved at 750 queries.
 
 ## Comparability
 
-The five result archives contain exactly the same 1,000 evaluation query IDs,
-20,255 `(query, product)` candidates, and ESCI labels. They also use the same
-prompt hash, maximum sequence length, scoring function, graded relevance, and
-seed. This makes the per-query comparisons paired rather than comparisons of
-different evaluation samples.
+All seven result archives draw from the same 1,000 evaluation query IDs,
+20,255 `(query, product)` candidates, and ESCI labels. V5 and v6 natively use
+the same deterministic 250-query development set and disjoint 750-query final
+holdout, with zero overlap. Older archives can be restricted to those exact
+750 IDs for paired comparison. All runs also use the same prompt hash, maximum
+sequence length, scoring function, graded relevance, and seed.
 
 The most controlled comparison is v1 versus v3. Both use 59,982 training
 pairs, 1,875 optimizer steps, one epoch, learning rate `2e-4`, batch size 4,
@@ -62,7 +58,19 @@ The archived base run also lacks v4 text cleaning; v4's step-zero development
 measurement supplies a cleaned-input base reference only for the 250-query
 development subset.
 
+V5 versus v4 primarily tests peak learning rate `1e-4` versus `2e-4`; both use
+10,000 queries, p12, cleaning, and the same development IDs. V6 versus v5 is
+the cleanest recent data-breadth comparison: v6 doubles selected training
+queries from 10,000 to 20,000 and halves pairs per query from 12 to 6. The
+realized pair and update budgets, model settings, learning rate, pair-type
+distribution, evaluation IDs, and checkpoint cadence remain effectively
+fixed.
+
 ## Ranking results
+
+The first table preserves the historical archives' official 1,000-query
+metrics. V5 and v6 are intentionally absent because their official final
+metrics use only the disjoint 750-query holdout.
 
 | Run | NDCG@10 | Direct P@10 | Direct R@10 | Broad P@10 | Broad R@10 |
 |---|---:|---:|---:|---:|---:|
@@ -91,22 +99,23 @@ is -0.001000, and broad Recall@10 is -0.002336.
 
 ### Untouched 750-query holdout
 
-The table above reproduces each archive's official 1,000-query metric. For an
-unbiased v4 comparison, remove the 250 query IDs used for development
-selection and average the remaining 750 queries:
+For an unbiased comparison, remove the 250 development query IDs from the
+older archives and average the remaining 750 queries. V5 and v6 report this
+holdout directly:
 
 | Run | NDCG@10 | Direct P@10 | Direct R@10 | Broad P@10 | Broad R@10 |
 |---|---:|---:|---:|---:|---:|
 | Base model | 0.825072 | 0.839619 | 0.612030 | 0.887115 | 0.604226 |
-| v1 | 0.850373 | 0.857219 | 0.630857 | **0.895648** | **0.612677** |
-| v3 | **0.851807** | **0.858552** | **0.632132** | 0.893381 | 0.611026 |
+| v1 | 0.850373 | 0.857219 | 0.630857 | 0.895648 | 0.612677 |
+| v3 | 0.851807 | 0.858552 | 0.632132 | 0.893381 | 0.611026 |
 | v4 | 0.850545 | 0.854819 | 0.626608 | 0.893381 | 0.609372 |
+| v5: 10k queries, p12, LR `1e-4` | 0.854425 | 0.856952 | 0.629724 | 0.895381 | 0.612037 |
+| **v6: 20k queries, p6, LR `1e-4`** | **0.861641** | **0.862285** | **0.635127** | **0.897781** | **0.613674** |
 
-On this untouched slice, v4 is only +0.000172 NDCG over v1 and is lower on
-all four precision/recall measures. The apparent full-set NDCG lead is
-concentrated in the development subset, where v4 is +0.007918 over v1. This is
-expected after selecting the checkpoint on that subset and is why future runs
-need a disjoint final metric. V5 implements that protocol directly.
+V5 improves NDCG over v4 but is otherwise close to v1/v3. V6 is the first run
+to lead this common holdout on every aggregate metric. Relative to v5 it gains
++0.007216 NDCG, +0.005333 direct precision, +0.005403 direct recall,
++0.002400 broad precision, and +0.001638 broad recall.
 
 ## Paired v3 versus v1 uncertainty
 
@@ -156,6 +165,25 @@ NDCG interval is [+0.018777, +0.033105]—but it is not distinguishable from v1.
 The untouched slice supports equivalence in NDCG with a small, uncertain
 recall tradeoff.
 
+## Paired v6 versus v5 uncertainty
+
+V6 and v5 use exactly the same 750 final query IDs. The following intervals
+come from 20,000 paired query bootstrap resamples; positive values favor v6.
+
+| Metric | Mean delta | Paired 95% interval | Queries better / worse / tied |
+|---|---:|---:|---:|
+| NDCG@10 | **+0.007216** | **[+0.001716, +0.012530]** | 336 / 293 / 121 |
+| Direct P@10 | **+0.005333** | **[+0.001067, +0.009600]** | 91 / 63 / 596 |
+| Direct R@10 | **+0.005403** | **[+0.000970, +0.009885]** | 91 / 63 / 596 |
+| Broad P@10 | +0.002400 | [-0.001333, +0.006000] | 66 / 54 / 630 |
+| Broad R@10 | +0.001638 | [-0.002083, +0.005316] | 66 / 54 / 630 |
+
+The NDCG and direct-relevance gains are resolved at this query sample; the
+broad gains are not. V6 also beats v1 by +0.011269 NDCG with a paired interval
+of [+0.005265, +0.017148]. Direct Precision@10 is +0.005067 over v1 with a
+barely positive interval of [+0.000133, +0.009867], while v6-versus-v1 direct
+recall and broad metrics remain directionally positive but uncertain.
+
 ## What balancing changed
 
 V3 kept the total pair and optimizer-step budgets fixed while redistributing
@@ -201,6 +229,32 @@ below the base model on `C>I`. Its average top ten contains 5.590 `E`, 2.988
 for v1. In other words, v4 promotes slightly more exact products, not more
 broadly relevant products overall; that explains the NDCG/recall tradeoff.
 
+### V6 boundary behavior on the 750-query holdout
+
+The same diagnostic restricted to the leakage-free holdout shows that v6
+improves every ESCI boundary relative to v5:
+
+| Boundary | Base | v1 | v3 | v4 | v5 | **v6** | v6 - v5 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `E>S` | 0.6640 | 0.6996 | 0.6994 | 0.7051 | 0.7108 | **0.7135** | +0.0027 |
+| `E>C` | 0.6449 | 0.7656 | 0.7574 | 0.7485 | 0.7444 | **0.7825** | **+0.0381** |
+| `E>I` | 0.7185 | 0.7546 | 0.7561 | 0.7675 | 0.7700 | **0.7750** | +0.0049 |
+| `S>C` | 0.4815 | 0.6639 | 0.6949 | 0.6583 | 0.6476 | **0.6993** | **+0.0517** |
+| `S>I` | 0.6229 | 0.6467 | 0.6431 | 0.6398 | 0.6460 | **0.6528** | +0.0068 |
+| `C>I` | **0.6286** | 0.5420 | 0.5811 | 0.5826 | 0.5656 | 0.5728 | +0.0071 |
+
+Query-clustered bootstrap intervals exclude zero for the two largest gains:
+`E>C` is [+0.0121, +0.0683] and `S>C` is [+0.0227, +0.0834]. The other four
+boundary changes are positive but uncertain. V6 still does not recover the
+base model's unusual `C>I` ordering, although it improves that boundary over
+v5.
+
+V6's average top ten contains 5.684 `E`, 2.933 `S`, 0.355 `C`, and 1.019 `I`
+products, versus v5's 5.627, 2.937, 0.384, and 1.043. It promotes more exact
+products and removes both complement and irrelevant products; unlike v4/v5,
+that shift accompanies improvements in direct precision/recall rather than an
+NDCG-only tradeoff.
+
 ## Training diagnostics
 
 | Run | Sampled pairs | Optimizer steps | Selected step | Mean RankNet loss | Training pair accuracy |
@@ -209,12 +263,19 @@ broadly relevant products overall; that explains the NDCG/recall tradeoff.
 | v2 | 117,691 | 3,678 | final | 0.345132 | 0.843191 |
 | v3 | 59,982 | 1,875 | final | 0.448906 | 0.784669 |
 | v4 | 119,959 | 3,749 | **1,875** | 0.428475 | 0.795905 |
+| v5 | 119,959 | 3,749 | **1,250** | 0.443419 | 0.784793 |
+| v6 | 120,000 | 3,750 | **2,500** | 0.494420 | 0.751958 |
 
 V1 and v3 training loss and accuracy are not directly comparable because v3
 contains many more scarce and difficult pair types. V2 is the useful warning:
 better optimization metrics accompanied worse held-out ranking metrics. V4
 reinforces that warning: its full-epoch training summary does not describe the
 exported adapter, because development selection restored the step-1,875 state.
+V5 and v6 strengthen the conclusion: v6 has a substantially higher full-epoch
+loss and lower pair accuracy than v5, but clearly better holdout ranking. Its
+broader query set contains harder or less repeatedly exposed comparisons, so
+loss values across these data distributions should not be interpreted as a
+quality leaderboard.
 
 ## V4 development trajectory
 
@@ -237,6 +298,28 @@ had already touched 9,998 of 10,000 training queries, but only 82,302 of
 additional products are unhelpful; it shows that the current optimizer and
 random-pair curriculum do not convert that added exposure into a gain.
 
+## V5 and V6 development trajectories
+
+V5 and v6 use the same fixed 250 development query IDs. Bold values are the
+checkpoint selected by NDCG@10.
+
+| Optimizer step | v5 NDCG@10 | v6 NDCG@10 |
+|---:|---:|---:|
+| 0 | 0.837277 | 0.837277 |
+| 625 | 0.855570 | 0.867532 |
+| 1,250 | **0.866981** | 0.864418 |
+| 1,875 | 0.862995 | 0.867245 |
+| 2,500 | 0.858689 | **0.870519** |
+| 3,125 | 0.855011 | 0.870191 |
+| final (3,749 / 3,750) | 0.856386 | 0.866708 |
+
+V5 peaked after one third of its updates and declined. V6 reached a higher
+peak after two thirds of an effectively identical update budget, and step
+3,125 was nearly tied. Broader query exposure therefore extended useful
+learning; it did not merely create a lucky early checkpoint. Development
+direct Recall@10 actually peaks at step 3,125 (0.654740), but NDCG selection
+correctly retains step 2,500 for the declared primary objective.
+
 ## Pair budget and product coverage
 
 The current setting is a **pair** budget, not an item budget. Products may be
@@ -250,55 +333,69 @@ reused in several pairs. The following deterministic simulation uses the same
 | 18 | 178,393 | 5,575 | 153,846 | 76.5% | 15.39 |
 | 24 | 235,374 | 7,356 | 169,157 | 84.1% | 16.92 |
 
+V6 tests breadth while holding that budget fixed:
+
+| Run | Queries | Pairs/query | Realized pairs | Optimizer steps | Candidate rows touched |
+|---|---:|---:|---:|---:|---:|
+| v5 | 10,000 | 12 | 119,959 | 3,749 | 127,379 |
+| v6 | 20,000 | 6 | 120,000 | 3,750 | **166,729** |
+
+V6 exposes 39,350 more query-product rows (+30.9%) at essentially identical
+compute. Its pair-type counts also remain very close to v5: the largest change
+is only 194 additional `E>S` pairs out of 120,000. The improvement is therefore
+better explained by query/candidate diversity than by label-boundary
+reweighting.
+
 There is genuine unused product coverage at p12, but simply raising the cap
 mostly adds the same dominant `E>S` and `E>I` distribution and greatly extends
 training. V2 already showed that doubling random pairs can improve training
-loss while harming held-out ranking. A better follow-up is a coverage-first or
-hard-pair sampler that uses more distinct products before reusing one, while
-holding the total pair/update budget fixed.
+loss while harming held-out ranking. V6 confirms the better alternative:
+spend the fixed budget across more queries. A coverage-first or hard-pair
+sampler can now build on v6 without increasing total updates.
 
 ## Decision and next experiment
 
-1. Do not promote v4 over v1/v3 based on the selected 1,000-query aggregate.
-   On the untouched 750 queries it is effectively tied in NDCG and lower in
-   recall. Continue to use v1 for broad retrieval and v3 when direct metrics or
-   the `C` boundaries are the priority.
-2. V5 now enforces a deterministic, disjoint evaluation protocol: 250 queries
-   are used only for checkpoint selection and the remaining 750 are used only
-   for final reporting. The job writes `evaluation_split.json` with both query
-   ID sets and records zero overlap in `metrics.json`. `--eval-only` applies
-   the identical split so its baseline remains directly comparable.
-3. Run the prepared controlled learning-rate experiment next:
-   `config/experiments/esci_v5_lr1e4.yaml` copies v4 and changes only peak
-   learning rate from `2e-4` to `1e-4`. It retains p12, the same 10,000
-   queries, cleaning, seed, schedule type, 250-query development subset, and
-   checkpoint interval. This tests whether slower updates can benefit from the
-   second half of product exposure instead of peaking at step 1,875.
-4. If budget permits a small rate sweep rather than one run, prioritize
-   `1e-4`, then `5e-5`; keep `2e-4` as the existing control. Do not combine the
-   rate sweep with p18/p24, sampler balancing, or hard mining.
-5. Do not raise random pairs per query yet. P18 would cost 5,575 optimizer
-   steps and p24 7,356, while the current run already declined after 1,875.
-   Best-checkpoint selection limits damage but does not make the extra compute
-   informative.
-6. After selecting a learning rate, test **coverage-first p12**: maximize
-   distinct products per query before reusing products, while preserving
-   cross-label validity and the same total pair count. If that helps, then
-   consider p18. Hard-pair sampling based on close scores or current ordering
-   errors is more promising than adding arbitrary pairs.
+1. Promote v6 as the current incumbent. It leads the untouched holdout on all
+   five aggregate metrics and has a resolved NDCG/direct-relevance advantage
+   over v5 at this query sample.
+2. Retain the v6 budget for the next optimization: 20,000 queries, p6,
+   120,000 pairs, LR `1e-4`, and the same 250/750 split. This prevents a new
+   sampler or loss experiment from being confounded with more compute.
+3. The next model-improvement experiment should use **within-query hard-pair
+   mining**: combine approximately 50% low-margin or misordered v6 training
+   pairs with 50% round-robin coverage pairs. Never treat products from other
+   queries as negatives because they are unjudged, not known irrelevant.
+4. A coverage-first p6 sampler is a lower-cost alternative: maximize distinct
+   products and available pair types within each query before reusing a
+   product. Hold the realized pair count at 120,000.
+5. Only after the sampling experiment, test a more metric-aligned loss. Start
+   with grade-gap-weighted RankNet, then consider hardness-plus-grade-gap or
+   LambdaRank/Delta-NDCG weighting. Avoid changing sampler and loss together.
+6. If the goal is a scientific claim rather than the best single checkpoint,
+   repeat v6 with another training seed. The paired intervals quantify query
+   uncertainty but not initialization or training-sample variance.
+7. Do not increase random pairs per query or run a broad LoRA/LR sweep yet.
+   V6 demonstrates that redistributing the existing budget is more productive
+   than adding arbitrary comparisons, and rank 16 shows no sign of a capacity
+   ceiling.
 
-The learning-rate interpretation needs one caveat. V4 uses a linear schedule
-over 3,749 steps; at the selected step 1,875, its instantaneous rate was about
-`1.05e-4`. That observation motivates a `1e-4` peak-rate run, but does not prove
-that `1e-4` is optimal—the selected checkpoint also reflects the amount and
-order of data already consumed. Intermediate evaluation remains essential.
+The strongest causal conclusion is narrow but useful: at the same learning
+rate, pair distribution, number of sampled pairs, optimizer updates, model,
+and evaluation split, moving from 10k/p12 to 20k/p6 materially improves held-
+out ranking. It does not by itself prove that 20k/p6 is globally optimal.
 
 ## Reproducibility notes
 
 - Aggregate values come from each archive's `evaluation/metrics.json`.
 - Paired intervals come from `evaluation/per_query_metrics.jsonl` with a fixed
-  bootstrap seed.
+  bootstrap seed of 42 and 20,000 resamples.
 - Boundary accuracy and top-ten label counts come from
   `evaluation/predictions.parquet`.
+- V5 and v6 `evaluation_split.json` files contain exactly equal development
+  and final query-ID lists; both record zero overlap.
+- V6 was interrupted four times. The retries resumed at optimizer steps 1,250,
+  1,325, 2,225, and 2,450, preserved model-selection state, completed step
+  3,750, restored the selected step-2,500 adapter, and exported the merged
+  model.
 - The archived raw scores are sufficient to recompute every table without
   rerunning model inference.
