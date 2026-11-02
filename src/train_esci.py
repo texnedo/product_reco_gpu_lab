@@ -43,7 +43,6 @@ import random
 import shutil
 import sys
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -80,6 +79,12 @@ from esci_core import (
     safe_text,
     sample_training_pairs,
 )
+from reranker_runtime import (
+    PromptEncoding,
+    encode_reranker_input,
+    forward_yes_no,
+    native_answer_token_ids,
+)
 from training_checkpoint import (
     best_checkpoint_metadata,
     load_best_model_checkpoint,
@@ -107,19 +112,6 @@ def selection_history_sort_key(row: dict[str, Any]) -> int:
 def json_scalar(value: Any) -> Any:
     """Convert numpy/pandas scalar IDs to values accepted by json.dumps."""
     return value.item() if hasattr(value, "item") else value
-
-
-# Native Qwen3-Reranker prompt contract. The contents of esci_v1.txt become
-# <Instruct>; they explain what "meets the requirements" means for products.
-RERANKER_PREFIX = (
-    "<|im_start|>system\n"
-    "Judge whether the Document meets the requirements based on the Query and "
-    'the Instruct provided. Note that the answer can only be "yes" or "no".'
-    "<|im_end|>\n<|im_start|>user\n"
-)
-RERANKER_SUFFIX = (
-    "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-)
 
 
 def training_run_configuration(
@@ -224,57 +216,6 @@ def sample_pairs(
     )
 
 
-@dataclass(frozen=True)
-class PromptEncoding:
-    """Tokenized constant prompt pieces and the remaining variable budget."""
-
-    prefix_ids: tuple[int, ...]
-    instruction_ids: tuple[int, ...]
-    suffix_ids: tuple[int, ...]
-    document_separator: str
-    max_variable_tokens: int
-
-    @classmethod
-    def build(
-        cls, tokenizer: Any, instruction: str, max_length: int
-    ) -> "PromptEncoding":
-        prefix_ids = tuple(
-            tokenizer.encode(RERANKER_PREFIX, add_special_tokens=False)
-        )
-        suffix_ids = tuple(
-            tokenizer.encode(RERANKER_SUFFIX, add_special_tokens=False)
-        )
-        instruction_ids = tuple(
-            tokenizer.encode(
-                f"<Instruct>: {instruction}\n<Query>: ",
-                add_special_tokens=False,
-            )
-        )
-        document_separator = "\n<Document>: "
-        separator_length = len(
-            tokenizer.encode(document_separator, add_special_tokens=False)
-        )
-        max_variable_tokens = (
-            max_length
-            - len(prefix_ids)
-            - len(instruction_ids)
-            - len(suffix_ids)
-        )
-        content_budget = max_variable_tokens - separator_length
-        if content_budget < 64:
-            raise ValueError(
-                f"max-length={max_length} leaves only {content_budget} "
-                "query/product tokens"
-            )
-        return cls(
-            prefix_ids=prefix_ids,
-            instruction_ids=instruction_ids,
-            suffix_ids=suffix_ids,
-            document_separator=document_separator,
-            max_variable_tokens=max_variable_tokens,
-        )
-
-
 class ProductDataset(Dataset):
     """Pointwise encoded products, reused by pair training and evaluation."""
 
@@ -295,24 +236,13 @@ class ProductDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = {name: values[index] for name, values in self.columns.items()}
-        variable_text = (
-            f"{safe_text(row['query'])}"
-            f"{self.prompt_encoding.document_separator}"
-            f"{product_document(row, self.text_cleaning)}"
-        )
-        variable_ids = self.tokenizer.encode(
-            variable_text,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.prompt_encoding.max_variable_tokens,
-        )
         return {
-            "input_ids": [
-                *self.prompt_encoding.prefix_ids,
-                *self.prompt_encoding.instruction_ids,
-                *variable_ids,
-                *self.prompt_encoding.suffix_ids,
-            ],
+            "input_ids": encode_reranker_input(
+                self.tokenizer,
+                self.prompt_encoding,
+                safe_text(row["query"]),
+                product_document(row, self.text_cleaning),
+            ),
             "gold_label": row["esci_label"],
             "query_id": row["query_id"],
             "product_id": row["product_id"],
@@ -383,112 +313,6 @@ class PairCollator:
         )
         batch["pair_types"] = [item["pair_type"] for item in items]
         return batch
-
-
-def native_answer_token_ids(tokenizer: Any) -> dict[str, int]:
-    """Resolve and validate Qwen's existing single-token yes/no answers."""
-    answer_token_ids = {}
-    for answer in ("yes", "no"):
-        token_ids = tokenizer.encode(answer, add_special_tokens=False)
-        if len(token_ids) != 1:
-            raise RuntimeError(
-                f"Reranker answer {answer!r} is not one token: {token_ids}"
-            )
-        answer_token_ids[answer] = token_ids[0]
-    return answer_token_ids
-
-
-def forward_yes_no(
-    model: Any,
-    input_ids: Any,
-    attention_mask: Any,
-    yes_no_token_tensor: Any,
-) -> tuple[Any, Any]:
-    """Return [batch, 2] yes/no logits and [batch] ranking scores.
-
-    Let H have shape [B, T, D], where B is batch size, T is sequence
-    length, and D is Qwen's hidden size. For item i we select h_i, the
-    hidden vector at its last non-padding token. Qwen's existing language
-    model head contains W_vocab with shape [V, D] and normally computes:
-
-        z_i = W_vocab @ h_i + b                 # V vocabulary logits
-
-    We only need the rows for the existing "yes" and "no" tokens:
-
-        z_yes = w_yes @ h_i + b_yes
-        z_no  = w_no  @ h_i + b_no
-        score = z_yes - z_no
-              = (w_yes - w_no) @ h_i + (b_yes - b_no)
-
-    Qwen's reference reranker applies a two-class softmax and returns:
-
-        p_yes = exp(z_yes) / (exp(z_yes) + exp(z_no))
-              = sigmoid(z_yes - z_no)
-              = sigmoid(score)
-
-    Sigmoid is strictly increasing, so sorting by p_yes and sorting by this
-    raw score produce exactly the same ranking. The raw score is the log-odds
-    log(p_yes / p_no); unlike a probability, it does not saturate to [0, 1]
-    before RankNet computes differences between two products.
-
-    With the default logits_to_keep=0, a normal causal-LM forward allocates
-    logits shaped [B, T, V]. This custom Qwen implementation also supports
-    logits_to_keep=1, which can reduce this to [B, 1, V] when the score
-    position is the final padded position, but it still projects to all V
-    vocabulary entries. This implementation ensures that right-padded rows have different final real-token
-    positions, and we only require two vocabulary entries.
-
-    Running the decoder directly and projecting only two rows therefore gives
-    the same z_yes/z_no values while avoiding the other positions and V-2
-    output logits. No values in W_vocab or b are zeroed or modified:
-    index_select constructs the smaller matrix [w_yes; w_no]. Algebraically,
-
-        (W_vocab @ h + b)[yes/no]
-        == W_vocab[yes/no] @ h + b[yes/no]
-
-    This does not bypass LoRA: get_base_model().model still contains PEFT's
-    adapted transformer layers. It only bypasses the unnecessary parts of the
-    existing vocabulary projection.
-    """
-    # PEFT exposes get_base_model(); an unwrapped Hugging Face model does not.
-    # Supporting both is what lets --eval-only score the untouched base model
-    # through exactly the same math used after LoRA training.
-    causal_model = (
-        model.get_base_model() if hasattr(model, "get_base_model") else model
-    )
-    # hidden_states: [B, T, D]. LoRA participates in this decoder computation.
-    hidden_states = causal_model.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-        return_dict=True,
-    ).last_hidden_state
-    # Prompts are right-padded, so sum(mask)-1 is each row's last real token.
-    # This is the position where the assistant is about to emit yes or no.
-    last_positions = attention_mask.sum(dim=1) - 1
-    final_hidden = hidden_states[
-        torch.arange(input_ids.shape[0], device=input_ids.device),
-        last_positions,
-    ]
-
-    # The LM head is Qwen's original vocabulary projection, not a new
-    # classifier. index_select copies/views the chosen rows into
-    # [w_yes; w_no], shape [2, D]; it does not mask or mutate the other rows.
-    output_layer = causal_model.get_output_embeddings()
-    weights = output_layer.weight.index_select(0, yes_no_token_tensor)
-    bias = (
-        output_layer.bias.index_select(0, yes_no_token_tensor)
-        if getattr(output_layer, "bias", None) is not None
-        else None
-    )
-    # functional.linear computes final_hidden @ weights.T + bias, producing
-    # [B, 2] in the token order [yes, no].
-    logits = functional.linear(final_hidden, weights, bias)
-
-    # This is both the default reranker's log-odds and a shift-invariant score:
-    # adding the same constant to yes/no logits cancels in their difference.
-    score = logits[:, 0] - logits[:, 1]
-    return logits, score
 
 
 def load_split(

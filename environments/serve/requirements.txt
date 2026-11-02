@@ -1,0 +1,6 @@
+duckdb==1.4.0
+fastapi>=0.115,<1
+safetensors==0.6.2
+torch==2.8.0
+transformers==4.57.0
+uvicorn[standard]>=0.34,<1
