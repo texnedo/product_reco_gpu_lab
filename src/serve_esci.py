@@ -168,23 +168,31 @@ def right_pad(
 
 
 class EsciRankService:
-    """Own one GPU model instance and serialize access to it."""
+    """Serve candidates, optionally owning one serialized GPU model."""
 
     def __init__(
         self,
-        model: Any,
-        tokenizer: Any,
-        device: torch.device,
-        prompt_encoding: PromptEncoding,
+        model: Any | None,
+        tokenizer: Any | None,
+        device: torch.device | None,
+        prompt_encoding: PromptEncoding | None,
         candidate_groups: dict[str, CandidateGroup],
         text_cleaning: str,
         batch_size: int,
         top_k: int,
-        model_name: str,
+        model_name: str | None,
     ) -> None:
         if batch_size <= 0 or top_k <= 0:
             raise ValueError("batch-size and top-k must be positive")
-        if tokenizer.pad_token_id is None:
+        model_parts = (model, tokenizer, device, prompt_encoding)
+        if any(part is not None for part in model_parts) and not all(
+            part is not None for part in model_parts
+        ):
+            raise ValueError(
+                "model, tokenizer, device, and prompt encoding must be "
+                "configured together"
+            )
+        if tokenizer is not None and tokenizer.pad_token_id is None:
             raise RuntimeError("Tokenizer has no pad token ID")
         self.model = model
         self.tokenizer = tokenizer
@@ -195,12 +203,14 @@ class EsciRankService:
         self.batch_size = batch_size
         self.top_k = top_k
         self.model_name = model_name
-        answer_ids = native_answer_token_ids(tokenizer)
-        self.yes_no_token_tensor = torch.tensor(
-            [answer_ids["yes"], answer_ids["no"]],
-            dtype=torch.long,
-            device=device,
-        )
+        self.yes_no_token_tensor = None
+        if tokenizer is not None:
+            answer_ids = native_answer_token_ids(tokenizer)
+            self.yes_no_token_tensor = torch.tensor(
+                [answer_ids["yes"], answer_ids["no"]],
+                dtype=torch.long,
+                device=device,
+            )
         # A single process should own a single GPU model. Requests wait here
         # instead of starting overlapping forwards with unpredictable memory.
         self.model_lock = threading.Lock()
@@ -211,11 +221,63 @@ class EsciRankService:
             for group in list(self.candidate_groups.values())[:limit]
         ]
 
+    def available_queries(self) -> list[dict[str, Any]]:
+        """Describe the complete in-memory candidate sample."""
+        return [
+            {
+                "query": group.query,
+                "candidate_count": len(group.products),
+            }
+            for group in self.candidate_groups.values()
+        ]
+
+    def unranked_candidates(
+        self, group: CandidateGroup, request_started: float
+    ) -> dict[str, Any]:
+        """Return the shuffled retrieval simulation without model scoring."""
+        preprocessing_started = time.perf_counter()
+        results = [
+            {
+                "input_position": input_position,
+                "product_id": str(product["product_id"]),
+                "title": safe_text(product["product_title"]),
+                "esci_label": product["esci_label"],
+            }
+            for input_position, product in enumerate(group.products)
+        ]
+        preprocessing_ms = (
+            time.perf_counter() - preprocessing_started
+        ) * 1_000
+        total_ms = (time.perf_counter() - request_started) * 1_000
+        timing = {
+            "queue_ms": 0.0,
+            "preprocessing_ms": round(preprocessing_ms, 3),
+            "inference_ms": 0.0,
+            "total_ms": round(total_ms, 3),
+        }
+        LOGGER.info(
+            "candidates_only query=%r candidates=%d total_ms=%.3f",
+            group.query,
+            len(results),
+            total_ms,
+        )
+        return {
+            "mode": "candidates_only",
+            "query": group.query,
+            "candidate_count": len(group.products),
+            "returned_count": len(results),
+            "model": None,
+            "results": results,
+            "timing": timing,
+        }
+
     def rank(self, requested_query: str) -> dict[str, Any]:
         request_started = time.perf_counter()
         group = self.candidate_groups.get(normalize_query(requested_query))
         if group is None:
             raise KeyError(requested_query)
+        if self.model is None:
+            return self.unranked_candidates(group, request_started)
 
         queue_started = time.perf_counter()
         with self.model_lock:
@@ -299,6 +361,7 @@ class EsciRankService:
             total_ms,
         )
         return {
+            "mode": "reranked",
             "query": group.query,
             "candidate_count": len(group.products),
             "returned_count": len(results),
@@ -310,6 +373,14 @@ class EsciRankService:
 
 def create_app(service: EsciRankService) -> FastAPI:
     app = FastAPI(title="Qwen ESCI serving lab", version="0.1.0")
+
+    @app.get("/queries")
+    def queries() -> dict[str, Any]:
+        loaded_queries = service.available_queries()
+        return {
+            "query_count": len(loaded_queries),
+            "queries": loaded_queries,
+        }
 
     @app.post("/rank")
     def rank(request: RankRequest) -> dict[str, Any]:
@@ -329,7 +400,14 @@ def create_app(service: EsciRankService) -> FastAPI:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        help=(
+            "Merged model directory. When omitted, /rank returns shuffled "
+            "unranked candidates for API and dataset debugging."
+        ),
+    )
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument(
         "--prompt-file",
@@ -375,11 +453,13 @@ def main() -> int:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     if args.max_length <= 0 or not 1 <= args.port <= 65_535:
         raise ValueError("max-length must be positive and port must be 1..65535")
-    if args.device == "cuda" and not torch.cuda.is_available():
+    if (
+        args.model_dir is not None
+        and args.device == "cuda"
+        and not torch.cuda.is_available()
+    ):
         raise RuntimeError("--device cuda requested, but CUDA is not available")
 
-    prompt_file = resolved_prompt_file(args.model_dir, args.prompt_file)
-    instruction = prompt_file.read_text(encoding="utf-8").strip()
     candidate_groups = load_candidate_groups(
         args.data_dir,
         args.query_count,
@@ -388,39 +468,59 @@ def main() -> int:
         args.seed,
     )
 
-    device = torch.device(args.device)
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
-    load_started = time.perf_counter()
-    LOGGER.info("Loading merged model from %s onto %s", args.model_dir, device)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_dir, local_files_only=True
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_dir,
-        local_files_only=True,
-        dtype=dtype,
-    )
-    model.config.use_cache = False
-    model.to(device).eval()
-    prompt_encoding = PromptEncoding.build(
-        tokenizer, instruction, args.max_length
-    )
-    service = EsciRankService(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        prompt_encoding=prompt_encoding,
-        candidate_groups=candidate_groups,
-        text_cleaning=args.text_cleaning,
-        batch_size=args.batch_size,
-        top_k=args.top_k,
-        model_name=args.model_dir.parent.name,
-    )
-    LOGGER.info(
-        "Model ready in %.3f seconds; sampled query examples: %s",
-        time.perf_counter() - load_started,
-        service.available_query_examples(),
-    )
+    if args.model_dir is None:
+        service = EsciRankService(
+            model=None,
+            tokenizer=None,
+            device=None,
+            prompt_encoding=None,
+            candidate_groups=candidate_groups,
+            text_cleaning=args.text_cleaning,
+            batch_size=args.batch_size,
+            top_k=args.top_k,
+            model_name=None,
+        )
+        LOGGER.warning(
+            "No --model-dir supplied; /rank will return all shuffled "
+            "candidates without scores. Sampled query examples: %s",
+            service.available_query_examples(),
+        )
+    else:
+        prompt_file = resolved_prompt_file(args.model_dir, args.prompt_file)
+        instruction = prompt_file.read_text(encoding="utf-8").strip()
+        device = torch.device(args.device)
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
+        load_started = time.perf_counter()
+        LOGGER.info("Loading merged model from %s onto %s", args.model_dir, device)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_dir, local_files_only=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_dir,
+            local_files_only=True,
+            dtype=dtype,
+        )
+        model.config.use_cache = False
+        model.to(device).eval()
+        prompt_encoding = PromptEncoding.build(
+            tokenizer, instruction, args.max_length
+        )
+        service = EsciRankService(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            prompt_encoding=prompt_encoding,
+            candidate_groups=candidate_groups,
+            text_cleaning=args.text_cleaning,
+            batch_size=args.batch_size,
+            top_k=args.top_k,
+            model_name=args.model_dir.parent.name,
+        )
+        LOGGER.info(
+            "Model ready in %.3f seconds; sampled query examples: %s",
+            time.perf_counter() - load_started,
+            service.available_query_examples(),
+        )
     # One process owns the model. Do not add multiple Uvicorn workers: every
     # worker would independently allocate another full model on the same GPU.
     uvicorn.run(

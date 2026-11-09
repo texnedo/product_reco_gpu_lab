@@ -220,6 +220,52 @@ resolved sampler and learning parameters, and realized pair-type counts. The
 model output contains the original YAML as `experiment_config_source.yaml`;
 `training_metadata.json` records the effective values after any CLI overrides.
 
+## Run the minimal serving prototype
+
+Install `environments/serve/requirements.txt`, then point the server at the
+downloaded `trained_model/merged` directory and prepared ESCI asset:
+
+```bash
+python src/serve_esci.py \
+  --model-dir artifacts/models/qwen-esci-v6/merged \
+  --data-dir artifacts/esci/v1 \
+  --query-count 20 \
+  --top-k 10
+```
+
+For dataset and API debugging before model weights are available, omit
+`--model-dir`:
+
+```bash
+python src/serve_esci.py \
+  --data-dir artifacts/esci/v1 \
+  --query-count 20
+```
+
+In this mode, `/rank` returns the complete shuffled candidate group with
+`mode: "candidates_only"`, no `rank` or `score`, and zero inference time. With
+a model loaded it returns `mode: "reranked"` and applies `--top-k`.
+
+The server deterministically samples complete query groups at startup and
+shuffles their candidates before scoring. List the exact queries currently in
+memory:
+
+```bash
+curl http://127.0.0.1:8000/queries
+```
+
+Then rerank one of those query strings:
+
+```bash
+curl -X POST http://127.0.0.1:8000/rank \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"replace with a query returned by /queries"}'
+```
+
+The response reports shuffled input positions, model scores, ESCI labels for
+lab inspection, and queue, preprocessing, GPU inference, and total latency.
+Run one Uvicorn worker because each worker would allocate another model copy.
+
 ## Review a completed run
 
 [`notebooks/qwen_esci_v1_run_review.ipynb`](notebooks/qwen_esci_v1_run_review.ipynb)
